@@ -1,6 +1,6 @@
 {
-    "device_properties_folder": "your_device_properties_folder",
-    "output_folder": "your_output_folder",
+    "device_properties_folder": "./data/device_properties/ibm/",
+    "output_folder": "./outputs/",
     "compiler_modules": ["src.baselines", "src.navi"],
     "network_config": {
         "fidelity_range": [0.90, 0.93],

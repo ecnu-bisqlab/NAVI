@@ -143,22 +143,6 @@ class FGPrOEE(Compiler):
                 # logical_phy_map = logical_phy_map,
             )
 
-            # Legacy evaluator path, kept for comparison/rollback:
-            # # 先计算teledata并更新logical_phy_map
-            # if lev > 0:
-            #     # TODO: CHECK
-            #     # self.num_swaps.append(self.calculate_nonlocal_communications(mapping_record_list.records[-2].partition,
-            #     #                                                              mapping_record_list.records[-1].partition))
-            #     _ = CompilerUtils.evaluate_teledata_with_local(
-            #         mapping_record_list.records[-1],
-            #         record,
-            #         network
-            #     )
-            #
-            # _ = CompilerUtils.evaluate_local_and_telegate_with_cat(
-            #     record, sub_qc, network, config=config
-            # )
-
             # 更新mapping_record_list
             mapping_record_list.add_record(record)
 

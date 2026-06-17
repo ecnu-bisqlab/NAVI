@@ -1,6 +1,6 @@
 .vscode/
 .codex
 config.json
-output
+tests/
 outputs/
 __pycache__/

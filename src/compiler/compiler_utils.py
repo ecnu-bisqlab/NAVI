@@ -80,13 +80,6 @@ class ExecCosts:
     def local_gate_breakdown_gap(self) -> int:
         return self.local_gate_num - self.local_gate_breakdown_num
 
-    @property
-    def remote_geometric_mean_fidelity(self) -> float:
-        if self.num_comms == 0:
-            return 1.0
-        rgeo_mean_fid = np.exp(self.remote_fidelity_log_sum / self.num_comms)
-        return rgeo_mean_fid
-
     def update(self, **kwargs):
         for key, value in kwargs.items():
             if hasattr(self, key):
@@ -100,7 +93,6 @@ class ExecCosts:
             f"comms={self.num_comms}, "
             f"cat_ents={self.cat_ents}, "
             f"epairs={self.epairs}, "
-            f"rgeo_mean_fid={self.remote_geometric_mean_fidelity}, "
             f"fidelity={self.total_fidelity:.4f}, "
             f"loss={self.total_fidelity_loss:.4f}, "
             f"rhops={self.remote_hops}, "
@@ -113,12 +105,12 @@ class ExecCosts:
             f"local_fidelity={self.local_fidelity}, "
             f"time={self.execution_time:.2f}), "
             f"local_gate_num={self.local_gate_num}, "
-            f"local_pre_transpile_gate_num={self.local_pre_transpile_gate_num}, "
-            f"local_transpile_added_gate_num={self.local_transpile_added_gate_num}, "
-            f"local_payload_gate_num={self.local_payload_gate_num}, "
-            f"local_comm_protocol_gate_num={self.local_comm_protocol_gate_num}, "
-            f"local_teledata_gate_num={self.local_teledata_gate_num}, "
-            f"local_uncategorized_gate_num={self.local_uncategorized_gate_num}, "
+            # f"local_pre_transpile_gate_num={self.local_pre_transpile_gate_num}, "
+            # f"local_transpile_added_gate_num={self.local_transpile_added_gate_num}, "
+            # f"local_payload_gate_num={self.local_payload_gate_num}, "
+            # f"local_comm_protocol_gate_num={self.local_comm_protocol_gate_num}, "
+            # f"local_teledata_gate_num={self.local_teledata_gate_num}, "
+            # f"local_uncategorized_gate_num={self.local_uncategorized_gate_num}, "
             f"payload_gate_num={self.payload_gate_num}"
             # Debug fields kept for temporary diagnostics; hide from default pprint/terminal output.
             # f", flush_calls={self.flush_calls}"
@@ -175,7 +167,6 @@ class ExecCosts:
             "num_comms": self.num_comms,
             "total_fidelity_log_sum": self.total_fidelity_log_sum,
             "total_fidelity_loss": self.total_fidelity_loss,
-            "rgeo_mean_fid": self.remote_geometric_mean_fidelity,
             "total_fidelity": self.total_fidelity,
             "local_gate_breakdown_num": self.local_gate_breakdown_num,
             "local_gate_breakdown_gap": self.local_gate_breakdown_gap,
@@ -185,9 +176,8 @@ class ExecCosts:
             "epairs",
             "execution_time",
             "num_comms",
-            "rgeo_mean_fid",
             "total_fidelity_log_sum",
-            "total_fidelity",
+            # "total_fidelity",
             "remote_hops",
             "remote_swaps",
             "cat_ents",
@@ -195,28 +185,18 @@ class ExecCosts:
             "remote_fidelity_loss",
             "local_fidelity_log_sum",
             "remote_fidelity_log_sum",
-            "local_fidelity",
-            "remote_fidelity",
+            # "local_fidelity",
+            # "remote_fidelity",
             "local_gate_num",
-            "local_pre_transpile_gate_num",
-            "local_transpile_added_gate_num",
-            "local_payload_gate_num",
-            "local_comm_protocol_gate_num",
-            "local_teledata_gate_num",
-            "local_uncategorized_gate_num",
-            "local_gate_breakdown_num",
-            "local_gate_breakdown_gap",
+            # "local_pre_transpile_gate_num",
+            # "local_transpile_added_gate_num",
+            # "local_payload_gate_num",
+            # "local_comm_protocol_gate_num",
+            # "local_teledata_gate_num",
+            # "local_uncategorized_gate_num",
+            # "local_gate_breakdown_num",
+            # "local_gate_breakdown_gap",
             "payload_gate_num",
-            # Debug fields kept for temporary diagnostics; hide from default CSV/JSON summaries.
-            # "flush_calls",
-            # "nonempty_flushes",
-            # "local_transpile_calls",
-            # "comm_block_events",
-            # "comm_block_remote_fidelity_loss",
-            # "comm_block_remote_fidelity_log_sum",
-            # "telegate_exec_events",
-            # "telegate_exec_remote_fidelity_loss",
-            # "telegate_exec_remote_fidelity_log_sum",
         ]
 
         # 生成有序字典
@@ -1951,7 +1931,7 @@ class CompilerUtils:
 
             if logical_phy_map:
                 for qubit in qubits_to_move:
-                    logical_phy_map[qubit] = (v, None) # TODO: 移到了一个新的QPU上，物理位不固定
+                    logical_phy_map[qubit] = (v, None) # 移到了一个新的QPU上，物理位不固定
 
             costs = CompilerUtils.update_remote_move_costs(
                 costs, u, v, data['weight'], network

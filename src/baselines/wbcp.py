@@ -420,10 +420,10 @@ class WBCP(Compiler):
         if not W_logical:
             return partition
 
-        # ---------- TODO: 获取物理QPU之间的通信成本 (Physical Cost Matrix) ----------
+        # ---------- 获取物理QPU之间的通信成本 (Physical Cost Matrix) ----------
         # C_physical[p1][p2]: 物理QPU p1 和 p2 之间的通信代价 (通常是跳数)
         # 使用 networkx 的 shortest_path_length 预计算所有物理节点对的距离
-        # 这样就不需要物理拓扑是全连接的了！
+        # 这样就不需要物理拓扑是全连接的了
         C_physical = {}
         for p1 in physical_qpu_ids:
             # 计算 p1 到所有点的最短路径

@@ -53,7 +53,7 @@ def _build_output_csv_path(global_config: dict, args, timestamp: str | None = No
         capacity_label = capacities[0]
     else:
         capacity_label = "-".join(capacities)
-    filename = f"{date_prefix}-{args.core_count}x{capacity_label}-{args.network}.csv"
+    filename = f"{date_prefix}-{args.core_count}x{capacity_label}.csv"
     return str(Path(str(global_config.get("output_folder", "outputs"))) / filename)
 
 
@@ -163,7 +163,7 @@ def main(args, timestamp: str | None = None, initial_stdout_buffer: io.StringIO 
             result = compiler.compile(trans_circ, network, compile_config)
             pprint(result.total_costs)
             result_info[compiler.name] = {
-                "F_eff": np.exp(result.total_costs.total_fidelity_log_sum / task_info["#Depth"]),
+                "F_eff": np.exp(result.total_costs.total_fidelity_log_sum / task_info["Depth"]),
                 **result.total_costs.to_dict()
             }
         except Exception as exc:

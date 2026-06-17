@@ -9,6 +9,25 @@ import sys
 
 _cached_config = None
 
+CSV_METRIC_LABELS = {
+    "F_eff": "F_norm",
+    "total_fidelity_loss": "Cumulative Error",
+    "epairs": "EPR Pair Consumption",
+    "execution_time": "Execution Time",
+}
+
+CSV_BASE_COLUMNS = [
+    "Circuit",
+    "#Qubits",
+    "#Gates",
+    "#2Q Gates",
+    "Depth",
+    "#QPUs",
+    "QPUs",
+    "net_type",
+]
+
+
 def parse_int_list(input_str: str) -> list[int]:
     """Convert a comma-separated string to a list of integers (e.g., '4,6,8' -> [4,6,8])"""
     try:
@@ -137,13 +156,12 @@ def write_compiler_results_to_csv(
 ):
     """
     通用化编译器结果写入CSV函数
-    动态读取task_info的所有字段作为基础列，自动识别result_info的指标和编译器名称
+    按CSV_BASE_COLUMNS筛选基础列，并按CSV_METRIC_LABELS筛选、重命名指标
     
     参数:
-        task_info: 任务信息字典，包含#Qubits、#Depths、#Gates、#2Q Gates、#QPUs等字段
+        task_info: 任务信息字典，包含Circuit、#Qubits、Depth、#QPUs、net_type等字段
         result_info: 结果信息字典，格式 {compiler_name: 指标字典}
         output_path: CSV输出路径
-        circuit_name: 电路名称（可选，默认Unknown_Circuit）
     """
     # -------------------------- 1. 预处理和提取核心信息 --------------------------
     # 1.1 提取所有编译器名称
@@ -152,13 +170,13 @@ def write_compiler_results_to_csv(
         print("警告：result_info为空，无数据可写入")
         return
     
-    # 1.2 提取所有指标名称（取第一个编译器的指标作为基准，确保所有编译器指标一致）
+    # 1.2 CSV仅展示选定指标；内部统计和序列化字段保持不变
     first_compiler = compiler_names[0]
     print(result_info[first_compiler])
-    metrics = list(result_info[first_compiler].keys())
+    metrics = list(CSV_METRIC_LABELS.items())
     
-    # 1.3 整理基础列（circuit_name + task_info的所有键）
-    base_columns = list(task_info.keys()) + ["Metrics"]
+    # 1.3 整理基础列
+    base_columns = CSV_BASE_COLUMNS + ["Metrics"]
     
     # -------------------------- 2. 初始化数据字典 --------------------------
     # 完整表头 = 基础列 + 所有编译器名称
@@ -166,13 +184,13 @@ def write_compiler_results_to_csv(
     data = {header: [] for header in full_headers}
     
     # -------------------------- 3. 填充数据 --------------------------
-    for metric in metrics:
-        # 3.1 填充task_info的所有字段（保持和task_info一致的顺序）
-        for task_key in task_info.keys():
+    for metric, metric_label in metrics:
+        # 3.1 填充固定基础列
+        for task_key in CSV_BASE_COLUMNS:
             data[task_key].append(task_info[task_key])
         
         # 3.2 填充当前指标名称
-        data["Metrics"].append(metric)
+        data["Metrics"].append(metric_label)
         
         # 3.3 填充每个编译器的对应指标值
         for compiler in compiler_names:
