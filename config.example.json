@@ -1,0 +1,9 @@
+{
+    "device_properties_folder": "your_device_properties_folder",
+    "output_folder": "your_output_folder",
+    "compiler_modules": ["src.baselines", "src.navi"],
+    "network_config": {
+        "fidelity_range": [0.90, 0.93],
+        "comm_slot_reserve": 2
+    }
+}

@@ -1,0 +1,6 @@
+.vscode/
+.codex
+config.json
+output
+outputs/
+__pycache__/
