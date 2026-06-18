@@ -216,12 +216,10 @@ def plot_network_robustness(
             ax.legend_.remove()
 
         ax.axhline(0, color="black", linestyle="--", linewidth=1.0, alpha=0.7)
-        ax.set_xlabel("")
+        ax.set_xlabel(rule.get("panel", ""), fontweight="bold", labelpad=12)
         ax.set_ylabel(rule["ylabel"], fontweight="bold")
         ax.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.25)
         plt.setp(ax.get_xticklabels(), rotation=18, ha="center", rotation_mode="anchor")
-        if rule.get("panel"):
-            ax.text(0.5, -0.18, rule["panel"], transform=ax.transAxes, ha="center", va="top")
 
     legend = None
     if legend_handles and legend_labels:
@@ -233,12 +231,12 @@ def plot_network_robustness(
             ncol=max(1, min(len(topology_order), 4)),
             frameon=False,
         )
-    fig.tight_layout(rect=(0, 0.08, 1, 0.92), w_pad=2.5)
+    fig.tight_layout(rect=(0, 0.14, 1, 0.92), w_pad=2.5)
     _, pdf_path = build_output_paths(output_prefix)
     if legend is not None:
-        fig.savefig(pdf_path, bbox_inches="tight", bbox_extra_artists=(legend,))
+        fig.savefig(pdf_path, bbox_inches="tight", bbox_extra_artists=(legend,), pad_inches=0.08)
     else:
-        fig.savefig(pdf_path, bbox_inches="tight")
+        fig.savefig(pdf_path, bbox_inches="tight", pad_inches=0.08)
     if show_in_notebook:
         plt.show()
     plt.close(fig)

@@ -12,8 +12,106 @@ from .config import DEFAULT_CONFIG, PlotConfig
 from .io import build_output_paths, finalize_plot_metadata
 
 
-def plot_dual_axis_epairs_fnorm(df_long, order=None, output_prefix: str | Path='random_scalability_qpus', circuit='Random', cfg: PlotConfig | None=None):
-    cfg = cfg or DEFAULT_CONFIG
+def _build_qpu_labels(df: pd.DataFrame, common_index: list[tuple[object, object]]) -> list[str]:
+    qpu_label_map = {}
+    key_cols = ['#Qubits', '#QPUs', 'QPUs']
+    df_cfg = df[key_cols].drop_duplicates()
+    for _, row in df_cfg.iterrows():
+        key = (row['#Qubits'], row['#QPUs'])
+        qpu_list = None
+        qpus_raw = row['QPUs']
+        if isinstance(qpus_raw, (list, tuple)) and len(qpus_raw) > 0:
+            qpu_list = list(qpus_raw)
+        elif isinstance(qpus_raw, str):
+            try:
+                parsed = ast.literal_eval(qpus_raw)
+                if isinstance(parsed, (list, tuple)) and len(parsed) > 0:
+                    qpu_list = list(parsed)
+            except (ValueError, SyntaxError):
+                pass
+        if qpu_list is not None:
+            vals = [float(v) for v in qpu_list]
+            if len(vals) > 0 and np.allclose(vals, vals[0]):
+                qpu_label_map[key] = rf"{int(row['#QPUs'])}$\times${int(round(vals[0]))}"
+            else:
+                qpu_label_map[key] = '[' + ', '.join((str(int(round(v))) for v in vals)) + ']'
+        elif row['#QPUs']:
+            size_per_qpu = row['#Qubits'] / row['#QPUs']
+            qpu_label_map[key] = rf"{int(row['#QPUs'])}$\times${int(round(float(size_per_qpu)))}"
+        else:
+            qpu_label_map[key] = str(row['#QPUs'])
+
+    x_labels = []
+    for qubits, qpus in common_index:
+        label = qpu_label_map.get((qubits, qpus))
+        if label is None:
+            if qpus:
+                size = int(round(float(qubits) / float(qpus)))
+                label = rf'{int(qpus)}$\times${int(size)}'
+            else:
+                label = str(qpus)
+        x_labels.append(label)
+    return x_labels
+
+
+def _fnorm_legend_handles(
+    df_f: pd.DataFrame,
+    df_e: pd.DataFrame,
+    cfg: PlotConfig,
+) -> tuple[list[Artist], list[Artist]]:
+    method_order = cfg.method_order
+    method_color = cfg.method_color
+    method_marker = cfg.method_marker
+    method_hatch = cfg.method_hatch
+    line_header = mlines.Line2D([0], [0], color='black', linewidth=2.5, label='$\\mathbf{F}_{\\mathbf{norm}}$')
+    line_row: list[Artist] = [line_header]
+    for m in method_order:
+        if m in df_f.columns:
+            line_row.append(mlines.Line2D([0], [0], color=method_color[m], marker=method_marker[m], linewidth=2.4 if m == 'NAVI (Ours)' else 2.0, markersize=13 if m == 'NAVI (Ours)' else 8, markeredgecolor='black', markeredgewidth=0.8, label=m))
+    bar_header = mpatches.Patch(facecolor='white', edgecolor='black', linewidth=1.5, label='EPR')
+    bar_row: list[Artist] = [bar_header]
+    for m in method_order:
+        if m in df_e.columns:
+            bar_row.append(mpatches.Patch(facecolor=method_color[m], edgecolor='black', hatch=method_hatch[m], linewidth=1.6 if m == 'NAVI (Ours)' else 1.0, label=m))
+    return line_row, bar_row
+
+
+def _add_fnorm_legends(
+    fig,
+    line_handles: list[Artist],
+    bar_handles: list[Artist],
+) -> tuple[Artist, Artist]:
+    legend_style = dict(
+        loc='upper center',
+        ncol=len(line_handles),
+        prop={'size': 13},
+        handlelength=1.5,
+        handletextpad=0.25,
+        columnspacing=0.8,
+        labelspacing=0.45,
+        alignment='center',
+        frameon=False,
+    )
+    line_legend = fig.legend(
+        handles=line_handles,
+        bbox_to_anchor=(0.28, 0.92),
+        **legend_style,
+    )
+    bar_legend = fig.legend(
+        handles=bar_handles,
+        bbox_to_anchor=(0.73, 0.92),
+        **legend_style,
+    )
+    return line_legend, bar_legend
+
+
+def _plot_dual_axis_epairs_fnorm_panel(
+    df_long: pd.DataFrame,
+    ax_left,
+    circuit: str,
+    cfg: PlotConfig,
+    panel_label: str | None = None,
+) -> tuple[pd.DataFrame, list[Artist], list[Artist]]:
     method_order = cfg.method_order
     method_color = cfg.method_color
     method_marker = cfg.method_marker
@@ -28,7 +126,6 @@ def plot_dual_axis_epairs_fnorm(df_long, order=None, output_prefix: str | Path='
     df_f = df_f.loc[common_index]
     df_e = df_e.loc[common_index]
     x = np.arange(len(common_index))
-    fig, ax_left = plt.subplots(figsize=(8, 5.6))
     ax_right = ax_left.twinx()
     ax_left.set_zorder(3)
     ax_right.set_zorder(2)
@@ -67,46 +164,13 @@ def plot_dual_axis_epairs_fnorm(df_long, order=None, output_prefix: str | Path='
     ax_left.set_ylim(lower, upper)
     ax_left.set_ylabel('$\\mathbf{F}_{\\mathbf{norm}}$')
     ax_right.set_ylabel('EPR Pair Consumption')
-    qpu_label_map = {}
-    key_cols = ['#Qubits', '#QPUs', 'QPUs']
-    df_cfg = df[key_cols].drop_duplicates()
-    for _, row in df_cfg.iterrows():
-        key = (row['#Qubits'], row['#QPUs'])
-        qpu_list = None
-        qpus_raw = row['QPUs']
-        if isinstance(qpus_raw, (list, tuple)) and len(qpus_raw) > 0:
-            qpu_list = list(qpus_raw)
-        elif isinstance(qpus_raw, str):
-            try:
-                parsed = ast.literal_eval(qpus_raw)
-                if isinstance(parsed, (list, tuple)) and len(parsed) > 0:
-                    qpu_list = list(parsed)
-            except (ValueError, SyntaxError):
-                pass
-        if qpu_list is not None:
-            vals = [float(v) for v in qpu_list]
-            if len(vals) > 0 and np.allclose(vals, vals[0]):
-                qpu_label_map[key] = rf"{int(row['#QPUs'])}$\times${int(round(vals[0]))}"
-            else:
-                qpu_label_map[key] = '[' + ', '.join((str(int(round(v))) for v in vals)) + ']'
-        elif row['#QPUs']:
-            size_per_qpu = row['#Qubits'] / row['#QPUs']
-            qpu_label_map[key] = rf"{int(row['#QPUs'])}$\times${int(round(float(size_per_qpu)))}"
-        else:
-            qpu_label_map[key] = str(row['#QPUs'])
-    x_labels = []
-    for qubits, qpus in common_index:
-        label = qpu_label_map.get((qubits, qpus))
-        if label is None:
-            if qpus:
-                size = int(round(float(qubits) / float(qpus)))
-                label = rf'{int(qpus)}$\times${int(size)}'
-            else:
-                label = str(qpus)
-        x_labels.append(label)
+    x_labels = _build_qpu_labels(df, common_index)
     ax_left.set_xticks(x)
     ax_left.set_xticklabels(x_labels)
-    ax_left.set_xlabel(r'#QPUs $\times$ #Qubits/QPU')
+    x_axis_label = r'#QPUs $\times$ #Qubits/QPU'
+    if panel_label:
+        x_axis_label = f'{x_axis_label}\n{panel_label}'
+    ax_left.set_xlabel(x_axis_label, labelpad=6)
     ax_left.grid(True, axis='y', linestyle='--', linewidth=0.6, alpha=0.35, zorder=0)
     for ax in [ax_left, ax_right]:
         for spine in ax.spines.values():
@@ -114,37 +178,69 @@ def plot_dual_axis_epairs_fnorm(df_long, order=None, output_prefix: str | Path='
     for ax in [ax_left, ax_right]:
         for label in ax.get_xticklabels() + ax.get_yticklabels():
             label.set_fontweight('bold')
-    line_header = mlines.Line2D([0], [0], color='black', linewidth=2.5, label='$\\mathbf{F}_{\\mathbf{norm}}$')
-    total_cols = len(method_order) + 1
-    blank_handle = mlines.Line2D([], [], linestyle='', marker='', alpha=0, label='')
-    line_row: list[Artist] = [line_header]
-    for m in method_order:
-        if m in df_f.columns:
-            line_row.append(mlines.Line2D([0], [0], color=method_color[m], marker=method_marker[m], linewidth=2.4 if m == 'NAVI (Ours)' else 2.0, markersize=13 if m == 'NAVI (Ours)' else 8, markeredgecolor='black', markeredgewidth=0.8, label=m))
-        else:
-            line_row.append(blank_handle)
-    bar_header = mpatches.Patch(facecolor='white', edgecolor='black', linewidth=1.5, label='EPR')
-    bar_row: list[Artist] = [bar_header]
-    for m in method_order:
-        if m in df_e.columns:
-            bar_row.append(mpatches.Patch(facecolor=method_color[m], edgecolor='black', hatch=method_hatch[m], linewidth=1.6 if m == 'NAVI (Ours)' else 1.0, label=m))
-        else:
-            bar_row.append(blank_handle)
-    legend_handles: list[Artist] = []
-    for h_line, h_bar in zip(line_row, bar_row):
-        legend_handles.extend([h_line, h_bar])
-    legend = fig.legend(handles=legend_handles, loc='upper left', bbox_to_anchor=(0.0, 0.97), ncol=total_cols, prop={'size': 13}, handlelength=1.5, handletextpad=0.25, columnspacing=1, labelspacing=0.45, alignment='left', frameon=False)
-    fig.tight_layout(rect=(0, 0, 1, 0.9))
-    _, pdf_path = build_output_paths(output_prefix)
-    fig.savefig(pdf_path, bbox_inches='tight', bbox_extra_artists=(legend,))
-    plt.show()
-    plt.close(fig)
+    line_handles, bar_handles = _fnorm_legend_handles(df_f, df_e, cfg)
     df_f_meta = df_f.reset_index().melt(id_vars=['#Qubits', '#QPUs'], value_vars=[m for m in method_order if m in df_f.columns], var_name='MethodShort', value_name='F_norm')
     df_e_meta = df_e.reset_index().melt(id_vars=['#Qubits', '#QPUs'], value_vars=[m for m in method_order if m in df_e.columns], var_name='MethodShort', value_name='EPR Pair Consumption')
     df_meta = df_f_meta.merge(df_e_meta, on=['#Qubits', '#QPUs', 'MethodShort'], how='inner')
     df_meta.insert(0, 'Circuit', circuit)
     df_meta['MethodOrder'] = df_meta['MethodShort'].map({m: i for i, m in enumerate(method_order)})
-    return finalize_plot_metadata(df_meta, ['Circuit', '#Qubits', '#QPUs', 'MethodShort', 'MethodOrder', 'F_norm', 'EPR Pair Consumption'], sort_by=['#Qubits', '#QPUs', 'MethodOrder'])
+    meta = finalize_plot_metadata(df_meta, ['Circuit', '#Qubits', '#QPUs', 'MethodShort', 'MethodOrder', 'F_norm', 'EPR Pair Consumption'], sort_by=['#Qubits', '#QPUs', 'MethodOrder'])
+    return meta, line_handles, bar_handles
+
+
+def plot_dual_axis_epairs_fnorm(df_long, order=None, output_prefix: str | Path='random_scalability_qpus', circuit='Random', cfg: PlotConfig | None=None):
+    cfg = cfg or DEFAULT_CONFIG
+    fig, ax_left = plt.subplots(figsize=(8, 5.6))
+    df_meta, line_handles, bar_handles = _plot_dual_axis_epairs_fnorm_panel(
+        df_long=df_long,
+        ax_left=ax_left,
+        circuit=circuit,
+        cfg=cfg,
+    )
+    legends = _add_fnorm_legends(fig, line_handles, bar_handles)
+    fig.tight_layout(rect=(0, 0, 1, 0.84))
+    _, pdf_path = build_output_paths(output_prefix)
+    fig.savefig(pdf_path, bbox_inches='tight', bbox_extra_artists=legends, pad_inches=0.08)
+    plt.show()
+    plt.close(fig)
+    return df_meta
+
+
+def plot_combined_scalability_fnorm(
+    df_long_scalability_qpu: pd.DataFrame,
+    df_long_qubits: pd.DataFrame,
+    output_prefix: str | Path='scalability',
+    circuit='Random',
+    cfg: PlotConfig | None=None,
+) -> pd.DataFrame:
+    cfg = cfg or DEFAULT_CONFIG
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6.3))
+    qpu_meta, line_handles, bar_handles = _plot_dual_axis_epairs_fnorm_panel(
+        df_long=df_long_scalability_qpu,
+        ax_left=axes[0],
+        circuit=circuit,
+        cfg=cfg,
+        panel_label='(a)',
+    )
+    qubits_meta, _, _ = _plot_dual_axis_epairs_fnorm_panel(
+        df_long=df_long_qubits,
+        ax_left=axes[1],
+        circuit=circuit,
+        cfg=cfg,
+        panel_label='(b)',
+    )
+    legends = _add_fnorm_legends(fig, line_handles, bar_handles)
+    fig.tight_layout(rect=(0, 0.12, 1, 0.88), w_pad=2.0)
+    _, pdf_path = build_output_paths(output_prefix)
+    fig.savefig(pdf_path, bbox_inches='tight', bbox_extra_artists=legends, pad_inches=0.08)
+    plt.show()
+    plt.close(fig)
+
+    qpu_meta = qpu_meta.copy()
+    qubits_meta = qubits_meta.copy()
+    qpu_meta.insert(0, 'Scalability', 'qpus')
+    qubits_meta.insert(0, 'Scalability', 'qubits')
+    return pd.concat([qpu_meta, qubits_meta], ignore_index=True)
 
 def plot_dual_axis_epairs_error(df_long, order=None, output_prefix: str | Path='random_scalability_qpus_error', circuit='Random', cfg: PlotConfig | None=None):
     cfg = cfg or DEFAULT_CONFIG
@@ -280,4 +376,4 @@ def plot_dual_axis_epairs_error(df_long, order=None, output_prefix: str | Path='
     df_meta['MethodOrder'] = df_meta['MethodShort'].map({m: i for i, m in enumerate(method_order)})
     return finalize_plot_metadata(df_meta, ['Circuit', '#Qubits', '#QPUs', 'MethodShort', 'MethodOrder', 'Cumulative Error', 'EPR Pair Consumption'], sort_by=['#Qubits', '#QPUs', 'MethodOrder'])
 
-__all__ = ['plot_dual_axis_epairs_fnorm', 'plot_dual_axis_epairs_error']
+__all__ = ['plot_dual_axis_epairs_fnorm', 'plot_dual_axis_epairs_error', 'plot_combined_scalability_fnorm']
