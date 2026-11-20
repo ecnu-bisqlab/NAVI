@@ -46,12 +46,18 @@ def get_args():
     # Global Information
     parser.add_argument('--global_config_path', '-gconf', type=str, required=False, default='config.json',
                         help='Path to the global configuration JSON file (string)')
+    parser.add_argument('--output_csv', '-ocsv', type=str, required=False, default=None,
+                        help='CSV filename under output_folder (for example, scalability.csv)')
+    parser.add_argument('--navi_shared_prefix', type=str, required=False, default=None,
+                        help='Reusable NAVI shared-prefix bundle for CommOpt parameter sweeps')
 
     # Circuit Information
     parser.add_argument('--circuit_name', '-cname', type=str, required=True,
                         help='Name of the quantum circuit (string)')
     parser.add_argument('--qubit_count', '-nq', type=int, required=True,
                         help='Number of qubits in the quantum circuit (integer)')
+    parser.add_argument('--circuit_seed', '-seed', type=int, required=False, default=None,
+                        help='Seed used to generate randomized benchmark circuits (integer)')
 
     # Network Information
     parser.add_argument('--core_count', '-core', type=int, required=True,
@@ -99,6 +105,7 @@ def get_args():
 
     print(f"[INFO] Name of the quantum circuit: {args.circuit_name}")
     print(f"[INFO] Number of qubits in the quantum circuit: {args.qubit_count}")
+    print(f"[INFO] Circuit generation seed: {args.circuit_seed}")
 
     print(f"[INFO] Number of QPUs: {args.core_count}")
     print(f"[INFO] Capacity of each QPU: {args.core_capacity}")
@@ -227,7 +234,7 @@ def write_compiler_results_to_csv(
     df.to_csv(
         output_path,
         mode = "a",
-        header = True, # not file_exists,
+        header = not file_exists,
         index = False,
         encoding = "utf-8"
     )

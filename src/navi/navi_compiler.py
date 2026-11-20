@@ -5,9 +5,11 @@ import sys
 import copy
 import itertools
 import json
+import math
 import numpy as np
 import networkx as nx
 import datetime
+import os
 from pathlib import Path
 
 from qiskit import QuantumCircuit, transpile
@@ -20,6 +22,81 @@ from .partitioner import Partitioner, PartitionerFactory
 from .partition_assigner import PartitionAssigner, PartitionAssignerFactory
 from .telegate_partitioner import TelegatePartitioner, TelegatePartitionerFactory
 from .mapper import Mapper, MapperFactory
+
+
+class InsufficientAtomicZeroCutSubcircuitsError(RuntimeError):
+    """Raised when a parameter-analysis circuit has too few atomic blocks."""
+
+    def __init__(self, benchmark: str, actual: int, minimum: int):
+        self.benchmark = benchmark
+        self.actual = actual
+        self.minimum = minimum
+        super().__init__(
+            f"CommOpt parameter analysis requires at least {minimum} atomic "
+            f"zero-cut subcircuits, but {benchmark} produced {actual}."
+        )
+
+
+def _mapopt_float_tolerance(left: float, right: float, atol: float, rtol: float) -> float:
+    return float(atol) + float(rtol) * max(abs(float(left)), abs(float(right)))
+
+
+def select_mapopt_source(
+        baseline: ExecCosts,
+        candidate: ExecCosts,
+        *,
+        atol: float = 1e-12,
+        rtol: float = 1e-12,
+    ) -> tuple[str, str]:
+    """Select a MapOpt result, rejecting only dominated or equivalent candidates."""
+    baseline_log = float(baseline.total_fidelity_log_sum)
+    candidate_log = float(candidate.total_fidelity_log_sum)
+    log_tol = _mapopt_float_tolerance(baseline_log, candidate_log, atol, rtol)
+    baseline_loss = float(baseline.total_fidelity_loss)
+    candidate_loss = float(candidate.total_fidelity_loss)
+    loss_tol = _mapopt_float_tolerance(baseline_loss, candidate_loss, atol, rtol)
+    baseline_epairs = int(baseline.epairs)
+    candidate_epairs = int(candidate.epairs)
+
+    log_equal = abs(baseline_log - candidate_log) <= log_tol
+    loss_equal = abs(baseline_loss - candidate_loss) <= loss_tol
+    epairs_equal = baseline_epairs == candidate_epairs
+    if log_equal and loss_equal and epairs_equal:
+        return "no_op", "equivalent_metrics"
+
+    baseline_weakly_better = (
+        baseline_log >= candidate_log - log_tol
+        and baseline_loss <= candidate_loss + loss_tol
+        and baseline_epairs <= candidate_epairs
+    )
+    baseline_strictly_better = (
+        baseline_log > candidate_log + log_tol
+        or baseline_loss < candidate_loss - loss_tol
+        or baseline_epairs < candidate_epairs
+    )
+    if baseline_weakly_better and baseline_strictly_better:
+        return "no_op", "baseline_dominates_candidate"
+    return "candidate", "candidate_not_dominated"
+
+
+def _mapopt_metric_snapshot(costs: ExecCosts, circuit_depth: int) -> dict[str, Any]:
+    log_sum = float(costs.total_fidelity_log_sum)
+    return {
+        "F_norm": math.exp(log_sum / circuit_depth) if circuit_depth > 0 else 1.0,
+        "Cumulative Error": float(costs.total_fidelity_loss),
+        "EPR Pair Consumption": int(costs.epairs),
+        "total_fidelity_log_sum": log_sum,
+    }
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=4, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
 
 
 @dataclass
@@ -65,6 +142,9 @@ class CompilationContext:
     telegate_total_calls: int = 0
     telegate_strict_seen_keys: set[Any] = field(default_factory=set)
     telegate_range_seen_keys: set[Any] = field(default_factory=set)
+    commopt_full_span_won: bool = False
+    slice_strategy: str = "greedy_table"
+    slice_planning_time_sec: float = 0.0
 
     # --- 运行时组件 (Runtime Components) ---
     partitioner: Optional[Partitioner] = None
@@ -93,7 +173,9 @@ class NAVI(Compiler):
         "partitioner",
         "max_option",
         "partition_assigner",
+        "slice_strategy",
     )
+    SLICE_STRATEGIES = ("dp", "greedy_table")
 
     def __init__(self):
         super().__init__()
@@ -109,9 +191,298 @@ class NAVI(Compiler):
 
     def get_shared_prefix_signature(self, config: Optional[dict[str, Any]] = None) -> tuple[Any, ...]:
         cfg = config or {}
-        return tuple(cfg.get(key) for key in self.SHARED_PREFIX_CONFIG_KEYS)
+        legacy_values = tuple(
+            cfg.get(key) for key in self.SHARED_PREFIX_CONFIG_KEYS[:-1]
+        )
+        return legacy_values + (self._resolve_slice_strategy(cfg),)
+
+    @classmethod
+    def _resolve_slice_strategy(cls, config: dict[str, Any]) -> str:
+        strategy = str(config.get("slice_strategy", "greedy_table")).strip().lower()
+        if strategy not in cls.SLICE_STRATEGIES:
+            available = ", ".join(cls.SLICE_STRATEGIES)
+            raise ValueError(
+                f"Unknown slice_strategy: {strategy!r}; available: {available}"
+            )
+        return strategy
 
     def build_shared_prefix_context(
+        self,
+        circuit: QuantumCircuit,
+        network: Network,
+        config: Optional[dict[str, Any]] = None,
+    ) -> tuple[CompilationContext, float]:
+        ctx, zero_cut_time = self._build_zero_cut_context(circuit, network, config)
+        assign_time = self._assign_partition_plan(ctx)
+        return ctx, zero_cut_time + assign_time
+
+    def _build_layerwise_zero_cut_context(
+        self,
+        circuit: QuantumCircuit,
+        network: Network,
+        config: Optional[dict[str, Any]] = None,
+    ) -> tuple[CompilationContext, float]:
+        """Build fixed one-two-qubit-layer segments without SliceOpt."""
+        cfg = copy.deepcopy(config or {})
+        partitioner_type = cfg.get("partitioner", "recursive_dp")
+        max_option = cfg.get("max_option", 1)
+        partitioner = PartitionerFactory.create_partitioner(
+            partitioner_type,
+            network,
+            max_options=max_option,
+        )
+        ctx = CompilationContext(
+            circuit=circuit,
+            network=network,
+            config=cfg,
+            partitioner=partitioner,
+        )
+
+        start_time = time.time()
+        self._step_remove_single_qubit_gates(ctx)
+        ctx.subc_ranges = [(index, index) for index in range(len(ctx.multiq_layers))]
+        ctx.partition_candidates = []
+        capacities = [int(value) for value in network.get_backend_qubit_counts()]
+
+        for index in range(len(ctx.multiq_layers)):
+            qig = self._build_qubit_interaction_graph_by_level(ctx, (index, index))
+            candidates = self._get_qig_partitions(qig, partitioner)
+            if not candidates:
+                raise RuntimeError(
+                    f"fixed layer segment {index} has no zero-cut partition candidate"
+                )
+            for partition in candidates:
+                if len(partition) != len(capacities):
+                    raise RuntimeError(
+                        f"fixed layer segment {index} produced {len(partition)} partitions; "
+                        f"expected {len(capacities)}"
+                    )
+                flattened = [qubit for group in partition for qubit in group]
+                if sorted(flattened) != list(range(circuit.num_qubits)):
+                    raise RuntimeError(
+                        f"fixed layer segment {index} partition does not cover each qubit exactly once"
+                    )
+                if any(len(group) > capacity for group, capacity in zip(partition, capacities)):
+                    raise RuntimeError(
+                        f"fixed layer segment {index} partition exceeds a QPU capacity"
+                    )
+            ctx.partition_candidates.append(candidates)
+
+        return ctx, time.time() - start_time
+
+    def _build_layerwise_static_context(
+        self,
+        circuit: QuantumCircuit,
+        network: Network,
+        config: Optional[dict[str, Any]] = None,
+    ) -> tuple[CompilationContext, float]:
+        """Build fixed-partition blocks without invoking SliceOpt.
+
+        This experimental context deliberately avoids the SliceOpt QIG,
+        connected-component partitioning, P table, and S/T table.  The same
+        contiguous capacity-based partition is reused for every block.  The
+        default keeps one block per native multi-qubit layer.  ``uniform_k``
+        instead builds K balanced contiguous blocks, where K is supplied as an
+        experimental budget rather than inferred from circuit interactions.
+        """
+        cfg = copy.deepcopy(config or {})
+        ctx = CompilationContext(
+            circuit=circuit,
+            network=network,
+            config=cfg,
+        )
+
+        start_time = time.time()
+        self._step_remove_single_qubit_gates(ctx)
+        num_layers = len(ctx.multiq_layers)
+        segmentation_mode = str(
+            cfg.get("static_segmentation_mode", "single_layer")
+        ).strip().lower()
+        if segmentation_mode == "single_layer":
+            ctx.subc_ranges = [
+                (index, index) for index in range(num_layers)
+            ]
+        elif segmentation_mode == "uniform_k":
+            benchmark = str(cfg.get("benchmark", ""))
+            budget_map = cfg.get("static_segment_budgets")
+            if not isinstance(budget_map, dict) or benchmark not in budget_map:
+                raise ValueError(
+                    "uniform_k static segmentation requires "
+                    "static_segment_budgets[benchmark]"
+                )
+            budget_raw = budget_map[benchmark]
+            if isinstance(budget_raw, bool):
+                raise ValueError("static segment budget must be a positive integer")
+            try:
+                requested_budget = int(budget_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "static segment budget must be a positive integer"
+                ) from exc
+            if requested_budget <= 0:
+                raise ValueError("static segment budget must be a positive integer")
+
+            effective_budget = min(requested_budget, num_layers)
+            ctx.subc_ranges = []
+            if effective_budget > 0:
+                base_width, remainder = divmod(num_layers, effective_budget)
+                left = 0
+                for block_index in range(effective_budget):
+                    width = base_width + int(block_index < remainder)
+                    right = left + width - 1
+                    ctx.subc_ranges.append((left, right))
+                    left = right + 1
+                assert left == num_layers
+            log(
+                "[static_partition] segmentation=uniform_k, "
+                f"benchmark={benchmark}, requested_k={requested_budget}, "
+                f"effective_k={effective_budget}, layers={num_layers}"
+            )
+        else:
+            raise ValueError(
+                "unknown static_segmentation_mode "
+                f"{segmentation_mode!r}; expected single_layer or uniform_k"
+            )
+        static_partition = CompilerUtils.allocate_qubits(circuit.num_qubits, network)
+        ctx.partition_candidates = [
+            [copy.deepcopy(static_partition)]
+            for _ in ctx.subc_ranges
+        ]
+        return ctx, time.time() - start_time
+
+    @staticmethod
+    def _resolve_mapopt_mapper_id(
+        config: dict[str, Any],
+        records: MappingRecordList,
+    ) -> str:
+        mapper_id = str(config.get("multi_record_mapper", "boundeddp_neighbor")).lower()
+        if mapper_id == "boundeddp_neighbor" and len(records.records) == 1:
+            return "single_record_greedy"
+        return mapper_id
+
+    def compile_leave_one_out(
+        self,
+        circuit: QuantumCircuit,
+        network: Network,
+        variant: str,
+        config: Optional[dict[str, Any]] = None,
+    ) -> tuple[MappingRecordList, dict[str, Any]]:
+        """Compile one leave-one-out NAVI variant and return audit statistics."""
+        cfg = copy.deepcopy(config or {})
+        normalized_variant = str(variant).strip().lower()
+        supported = {
+            "commopt_mapopt",
+            "sliceopt_mapopt",
+            "static_commopt_mapopt",
+        }
+        if normalized_variant not in supported:
+            raise ValueError(
+                f"unknown NAVI leave-one-out variant {variant!r}; "
+                f"expected one of {sorted(supported)}"
+            )
+
+        print(f"Compiling with [NAVI:{normalized_variant}]...")
+        if normalized_variant == "commopt_mapopt":
+            shared_ctx, prefix_time = self._build_layerwise_zero_cut_context(
+                circuit,
+                network,
+                cfg,
+            )
+            prefix_time += self._assign_partition_plan(shared_ctx)
+            ctx = self._prepare_ctx_from_shared_prefix(shared_ctx, cfg)
+            records_start = time.time()
+            pre_map_records = self._step_construct_hybrid_records_beam(ctx)
+            records_time = time.time() - records_start
+        elif normalized_variant == "static_commopt_mapopt":
+            # The w/o SliceOpt ablation must not recover a whole-circuit
+            # partition through CommOpt's special full-span safeguard.
+            cfg["hybrid_full_span_safeguard"] = False
+            shared_ctx, prefix_time = self._build_layerwise_static_context(
+                circuit,
+                network,
+                cfg,
+            )
+            prefix_time += self._assign_partition_plan(
+                shared_ctx,
+                partition_assigner_type="direct",
+            )
+            ctx = self._prepare_ctx_from_shared_prefix(shared_ctx, cfg)
+            ctx.config["hybrid_full_span_safeguard"] = False
+            records_start = time.time()
+            pre_map_records = self._step_construct_hybrid_records_beam(ctx)
+            records_time = time.time() - records_start
+        else:
+            shared_ctx, prefix_time = self._build_zero_cut_context(circuit, network, cfg)
+            prefix_time += self._assign_partition_plan(shared_ctx)
+            ctx = self._prepare_ctx_from_shared_prefix(shared_ctx, cfg)
+            records_start = time.time()
+            pre_map_records = self._step_construct_teledata_only_records(ctx)
+            records_time = time.time() - records_start
+            if any(record.mapping_type != "teledata" for record in pre_map_records.records):
+                raise RuntimeError("SliceOpt+MapOpt must contain only TeleData records before MapOpt")
+
+        if not pre_map_records.records:
+            raise RuntimeError(f"{normalized_variant} produced no records before MapOpt")
+        pre_map_records.ensure_record_ops(ctx.circuit, ctx.circuit_layers)
+        pre_map_type_counts = {
+            "teledata": sum(
+                record.mapping_type == "teledata" for record in pre_map_records.records
+            ),
+            "telegate": sum(
+                record.mapping_type in {"cat", "telegate"}
+                for record in pre_map_records.records
+            ),
+        }
+        mapper_id = self._resolve_mapopt_mapper_id(cfg, pre_map_records)
+        result = self._map_records_with_mapper(
+            ctx,
+            pre_map_records,
+            mapper_id=mapper_id,
+            shared_prefix_time=prefix_time,
+            records_time=records_time,
+        )
+        post_map_type_counts = {
+            "teledata": sum(
+                record.mapping_type == "teledata" for record in result.records
+            ),
+            "telegate": sum(
+                record.mapping_type in {"cat", "telegate"}
+                for record in result.records
+            ),
+        }
+        stats = {
+            "variant": normalized_variant,
+            "slice_strategy": ctx.slice_strategy,
+            "slice_planning_time_sec": float(ctx.slice_planning_time_sec),
+            "segment_count": len(ctx.subc_ranges),
+            "pre_map_record_count": len(pre_map_records.records),
+            "pre_map_teledata_record_count": pre_map_type_counts["teledata"],
+            "pre_map_telegate_record_count": pre_map_type_counts["telegate"],
+            "post_map_record_count": len(result.records),
+            "post_map_teledata_record_count": post_map_type_counts["teledata"],
+            "post_map_telegate_record_count": post_map_type_counts["telegate"],
+            "mapper_id": mapper_id,
+            "telegate_total_calls": int(ctx.telegate_total_calls),
+            "telegate_cache_hits": int(ctx.telegate_cache_hits),
+            "telegate_cache_relaxed_hits": int(ctx.telegate_cache_relaxed_hits),
+            "telegate_cache_misses": int(ctx.telegate_cache_misses),
+            "full_span_safeguard_enabled": bool(
+                ctx.config.get("hybrid_full_span_safeguard", True)
+            ),
+            "commopt_full_span_won": bool(
+                ctx.commopt_full_span_won
+                or (
+                    len(pre_map_records.records) == 1
+                    and pre_map_records.records[0].mapping_type in {"cat", "telegate"}
+                    and int(pre_map_records.records[0].layer_start) == 0
+                    and int(pre_map_records.records[0].layer_end)
+                    == len(ctx.circuit_layers) - 1
+                )
+            ),
+        }
+        return result, stats
+
+    def _build_zero_cut_context(
         self,
         circuit: QuantumCircuit,
         network: Network,
@@ -120,35 +491,81 @@ class NAVI(Compiler):
         if config is None:
             config = {}
 
+        slice_strategy = self._resolve_slice_strategy(config)
         partitioner_type = config.get("partitioner", "recursive_dp")
         max_option = config.get("max_option", 1)
         partitioner = PartitionerFactory.create_partitioner(partitioner_type, network, max_options=max_option)
-
-        partition_assigner_type = config.get("partition_assigner", "global_max_match")
-        partition_assigner = PartitionAssignerFactory.create_assigner(partition_assigner_type)
 
         ctx = CompilationContext(
             circuit=circuit,
             network=network,
             config=copy.deepcopy(config),
             partitioner=partitioner,
-            partition_assigner=partition_assigner,
+            slice_strategy=slice_strategy,
         )
+        ctx.config["slice_strategy"] = slice_strategy
 
         start_time = time.time()
 
         self._step_remove_single_qubit_gates(ctx)
         ctx.P_table = self._step_build_partition_table(ctx)
-        ctx.subc_ranges = self._step_build_slicing_table(ctx)
+        ctx.subc_ranges = self._step_select_slicing(ctx)
+
+        minimum_raw = config.get("min_atomic_zero_cut_subcircuits", 0)
+        try:
+            minimum_atomic_subcircuits = int(minimum_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "min_atomic_zero_cut_subcircuits must be a nonnegative integer"
+            ) from exc
+        if minimum_atomic_subcircuits < 0:
+            raise ValueError(
+                "min_atomic_zero_cut_subcircuits must be a nonnegative integer"
+            )
+
+        atomic_subcircuit_count = len(ctx.subc_ranges)
+        if (
+            minimum_atomic_subcircuits > 0
+            and atomic_subcircuit_count < minimum_atomic_subcircuits
+        ):
+            benchmark = str(config.get("benchmark", config.get("circuit_name", "unknown")))
+            print(
+                "[COMMOPT_INELIGIBLE] "
+                + json.dumps({
+                    "benchmark": benchmark,
+                    "atomic_zero_cut_subcircuit_count": atomic_subcircuit_count,
+                    "minimum_required": minimum_atomic_subcircuits,
+                }, sort_keys=True),
+                flush=True,
+            )
+            raise InsufficientAtomicZeroCutSubcircuitsError(
+                benchmark,
+                atomic_subcircuit_count,
+                minimum_atomic_subcircuits,
+            )
+
         ctx.partition_candidates = [ctx.P_table[i][j] for (i, j) in ctx.subc_ranges]
 
+        return ctx, time.time() - start_time
+
+    def _assign_partition_plan(
+        self,
+        ctx: CompilationContext,
+        partition_assigner_type: Optional[str] = None,
+    ) -> float:
+        assigner_type = partition_assigner_type or str(
+            ctx.config.get("partition_assigner", "max_match")
+        )
+        ctx.partition_assigner = PartitionAssignerFactory.create_assigner(assigner_type)
         assert ctx.partition_assigner is not None
         assign_time = time.time()
         assign_result = ctx.partition_assigner.assign(ctx.partition_candidates)
         ctx.partition_plan = assign_result["partition_plan"]
-        assign_elapsed = time.time() - assign_time
-
-        return ctx, time.time() - start_time
+        log(
+            f"[partition_assigner] type={assigner_type}, "
+            f"name={ctx.partition_assigner.name}"
+        )
+        return time.time() - assign_time
 
     def compile_from_shared_prefix(
         self,
@@ -279,6 +696,9 @@ class NAVI(Compiler):
         if config is None:
             config = {}
 
+        if bool(config.get("ablation_mode", False)):
+            return self._compile_ablation(circuit, network, config)
+
         shared_ctx, shared_prefix_time = self.build_shared_prefix_context(circuit, network, config)
         ctx = self._prepare_ctx_from_shared_prefix(shared_ctx, config)
 
@@ -286,6 +706,78 @@ class NAVI(Compiler):
             ctx,
             shared_prefix_time=shared_prefix_time,
             override_mapper_id=override_mapper_id,
+        )
+
+    def _compile_ablation(
+        self,
+        circuit: QuantumCircuit,
+        network: Network,
+        config: dict[str, Any],
+    ) -> MappingRecordList:
+        """Build NAVI-Td, NAVI-Hy, and full NAVI from one zero-cut prefix."""
+        if not bool(config.get("navi_checkpoint_enabled", False)):
+            raise ValueError("NAVI ablation mode requires navi_checkpoint.enabled=true")
+
+        zero_cut_ctx, zero_cut_time = self._build_zero_cut_context(
+            circuit,
+            network,
+            config,
+        )
+
+        direct_assigned_ctx = copy.deepcopy(zero_cut_ctx)
+        direct_assign_time = self._assign_partition_plan(
+            direct_assigned_ctx,
+            partition_assigner_type="direct",
+        )
+
+        td_ctx = self._prepare_ctx_from_shared_prefix(direct_assigned_ctx, config)
+        td_start = time.time()
+        teledata_records = self._step_construct_teledata_only_records(td_ctx)
+        if any(record.mapping_type != "teledata" for record in teledata_records.records):
+            raise RuntimeError("NAVI-Td ablation must contain only teledata records")
+        teledata_records.ensure_record_ops(td_ctx.circuit, td_ctx.circuit_layers)
+        td_time = zero_cut_time + direct_assign_time + (time.time() - td_start)
+        self._save_checkpoint_records(
+            td_ctx,
+            "NAVI-Td",
+            "NAVI-Td_raw.json",
+            teledata_records,
+            execution_time=td_time,
+        )
+
+        hy_ctx = self._prepare_ctx_from_shared_prefix(direct_assigned_ctx, config)
+        hy_start = time.time()
+        hybrid_records = self._step_construct_hybrid_records_beam(hy_ctx)
+        hybrid_records.ensure_record_ops(hy_ctx.circuit, hy_ctx.circuit_layers)
+        hy_time = zero_cut_time + direct_assign_time + (time.time() - hy_start)
+        self._save_checkpoint_records(
+            hy_ctx,
+            "NAVI-Hy",
+            "NAVI-Hy_raw.json",
+            hybrid_records,
+            execution_time=hy_time,
+        )
+
+        max_match_ctx = copy.deepcopy(zero_cut_ctx)
+        max_match_time = self._assign_partition_plan(max_match_ctx)
+        full_ctx = self._prepare_ctx_from_shared_prefix(max_match_ctx, config)
+        hybrid_start = time.time()
+        full_hybrid_records = self._step_construct_hybrid_records_beam(full_ctx)
+        full_hybrid_records.ensure_record_ops(full_ctx.circuit, full_ctx.circuit_layers)
+        hybrid_time = time.time() - hybrid_start
+
+        mapper_id = str(
+            config.get("multi_record_mapper", "boundeddp_neighbor")
+        ).lower()
+        if mapper_id == "boundeddp_neighbor" and len(full_hybrid_records.records) == 1:
+            mapper_id = "single_record_greedy"
+
+        return self._map_records_with_mapper(
+            full_ctx,
+            full_hybrid_records,
+            mapper_id=mapper_id,
+            shared_prefix_time=zero_cut_time + max_match_time,
+            records_time=hybrid_time,
         )
 
     def _construct_records_from_ctx(
@@ -305,7 +797,9 @@ class NAVI(Compiler):
         )
         teledata_eval_epairs = float(teledata_only_records.total_costs.epairs)
 
+        commopt_start = time.perf_counter()
         hybrid_records = self._step_construct_hybrid_records_beam(ctx)
+        commopt_time = time.perf_counter() - commopt_start
         self._save_checkpoint_records(
             ctx,
             "NAVI-Hy",
@@ -316,8 +810,47 @@ class NAVI(Compiler):
         hybrid_eval_epairs = hybrid_records.total_costs.epairs
 
         selected_records = hybrid_records
+        selected_source = "hybrid"
         if teledata_eval_epairs < hybrid_eval_epairs:
             selected_records = teledata_only_records
+            selected_source = "teledata"
+
+        beam_width = max(1, int(ctx.config.get("hybrid_beam_width", 1)))
+        max_merge_span = max(1, int(ctx.config.get("hybrid_max_merge_span", 10)))
+        merge_probe_budget = max(1, int(ctx.config.get("hybrid_merge_probe_budget", 10)))
+        pos_probe_budget = max(1, int(ctx.config.get("hybrid_pos_probe_budget", len(ctx.subc_ranges))))
+        assigner_name = ctx.partition_assigner.name if ctx.partition_assigner is not None else "unknown"
+        analysis_record = {
+            "benchmark": str(ctx.config.get("benchmark", ctx.config.get("circuit_name", "unknown"))),
+            "circuit_seed": ctx.config.get("circuit_seed"),
+            "slice_strategy": ctx.slice_strategy,
+            "slice_planning_time_sec": float(ctx.slice_planning_time_sec),
+            "K": len(ctx.subc_ranges),
+            "W": beam_width,
+            "L_max": max_merge_span,
+            "effective_local_Lmax": min(len(ctx.subc_ranges), max_merge_span),
+            "partition_assigner": str(ctx.config.get("partition_assigner", "max_match")),
+            "partition_assigner_name": assigner_name,
+            "merge_probe_budget": merge_probe_budget,
+            "pos_probe_budget": pos_probe_budget,
+            "teledata_epairs_internal": float(teledata_eval_epairs),
+            "hybrid_epairs_internal": float(hybrid_eval_epairs),
+            "selected_epairs_internal": float(selected_records.total_costs.epairs),
+            "selected_source": selected_source,
+            "teledata_record_count": len(teledata_only_records.records),
+            "hybrid_record_count": len(hybrid_records.records),
+            "selected_record_count": len(selected_records.records),
+            "commopt_time_sec": float(commopt_time),
+            "telegate_total_calls": ctx.telegate_total_calls,
+            "telegate_cache_hits": ctx.telegate_cache_hits,
+            "telegate_cache_relaxed_hits": ctx.telegate_cache_relaxed_hits,
+            "telegate_cache_misses": ctx.telegate_cache_misses,
+            "full_span_safeguard_enabled": bool(
+                ctx.config.get("hybrid_full_span_safeguard", True)
+            ),
+            "full_span_candidate_won": ctx.commopt_full_span_won,
+        }
+        print(f"[COMMOPT_ANALYSIS] {json.dumps(analysis_record, sort_keys=True)}")
 
         total_cache_hits = ctx.telegate_cache_hits + ctx.telegate_cache_relaxed_hits
         total_telegate_calls = total_cache_hits + ctx.telegate_cache_misses
@@ -346,11 +879,20 @@ class NAVI(Compiler):
         shared_prefix_time: float = 0.0,
         records_time: float = 0.0,
     ) -> MappingRecordList:
+        mapper_key = str(mapper_id).lower()
+        baseline_raw = copy.deepcopy(records)
+        identity_perm = list(range(ctx.network.num_backends))
+        for record in baseline_raw.records:
+            extra_info = copy.deepcopy(record.extra_info) if record.extra_info is not None else {}
+            extra_info["perm"] = identity_perm.copy()
+            record.extra_info = extra_info
+        baseline_raw.ensure_record_ops(ctx.circuit, ctx.circuit_layers)
+
         mapper_start_time = time.time()
         ctx.hybrid_records = copy.deepcopy(records)
-        ctx.mapper = MapperFactory.create_mapper(str(mapper_id).lower())
+        ctx.mapper = MapperFactory.create_mapper(mapper_key)
 
-        final_result = ctx.mapper.map(
+        candidate_internal = ctx.mapper.map(
             ctx.hybrid_records,
             ctx.circuit,
             ctx.circuit_layers,
@@ -358,35 +900,161 @@ class NAVI(Compiler):
             config=ctx.config,
         )
 
-        final_result.ensure_record_ops(ctx.circuit, ctx.circuit_layers)
-        self._save_checkpoint_records(ctx, "NAVI", "NAVI_raw.json", final_result)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        circuit_name = str(ctx.config.get("circuit_name", f"circuit_{ctx.circuit.num_qubits}"))
-        base_path = CompilerUtils.build_record_base_path(circuit_name, ctx.network, self.name, timestamp)
-        final_result.save_records(f"{base_path}_raw.json", dump_type="raw")
+        candidate_internal.ensure_record_ops(ctx.circuit, ctx.circuit_layers)
+        beam_stats = copy.deepcopy(
+            getattr(candidate_internal, "mapopt_beam_stats", {}) or {}
+        )
+        candidate_raw = copy.deepcopy(candidate_internal)
+        mapper_time = time.time() - mapper_start_time
+        configured_output_base = ctx.config.get("record_output_base")
+        if configured_output_base:
+            base_path = str(Path(str(configured_output_base)))
+        else:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            circuit_name = str(ctx.config.get("circuit_name", f"circuit_{ctx.circuit.num_qubits}"))
+            base_path = CompilerUtils.build_record_base_path(
+                circuit_name,
+                ctx.network,
+                self.name,
+                timestamp,
+                output_folder=str(ctx.config.get("_output_folder", "./outputs")),
+            )
 
         policy_name = ctx.config.get("evaluator_policy")
-        pre_eval_time = shared_prefix_time + records_time + (time.time() - mapper_start_time)
-        final_result, _, _ = self._evaluate_raw_mapping_records_with_timing(
-            final_result,
+        pre_eval_time = shared_prefix_time + records_time + mapper_time
+        candidate_evaluated, _, candidate_eval_time = self._evaluate_raw_mapping_records_with_timing(
+            copy.deepcopy(candidate_raw),
             ctx.network,
             policy_name=policy_name,
             config=ctx.config,
             pre_eval_time=pre_eval_time,
         )
 
-        exec_time = shared_prefix_time + records_time + (time.time() - mapper_start_time)
+        safeguard_enabled = (
+            mapper_key != "direct"
+            and bool(ctx.config.get("mapopt_dominance_safeguard", True))
+        )
+        cost_atol = float(ctx.config.get("mapopt_cost_atol", 1e-12))
+        cost_rtol = float(ctx.config.get("mapopt_cost_rtol", 1e-12))
+        if not math.isfinite(cost_atol) or cost_atol < 0:
+            raise ValueError("mapopt_cost_atol must be a finite nonnegative number")
+        if not math.isfinite(cost_rtol) or cost_rtol < 0:
+            raise ValueError("mapopt_cost_rtol must be a finite nonnegative number")
+        baseline_evaluated: Optional[MappingRecordList] = None
+        baseline_eval_time = 0.0
+        selected_source = "candidate"
+        selection_reason = "safeguard_not_applicable"
+        if safeguard_enabled:
+            baseline_evaluated, _, baseline_eval_time = self._evaluate_raw_mapping_records_with_timing(
+                copy.deepcopy(baseline_raw),
+                ctx.network,
+                policy_name=policy_name,
+                config=ctx.config,
+                pre_eval_time=pre_eval_time + candidate_eval_time,
+            )
+            selected_source, selection_reason = select_mapopt_source(
+                baseline_evaluated.total_costs,
+                candidate_evaluated.total_costs,
+                atol=cost_atol,
+                rtol=cost_rtol,
+            )
+
+        if selected_source == "no_op":
+            assert baseline_evaluated is not None
+            selected_raw = baseline_raw
+            final_result = baseline_evaluated
+        else:
+            selected_raw = candidate_raw
+            final_result = candidate_evaluated
+
+        exec_time = pre_eval_time + candidate_eval_time + baseline_eval_time
         log(f"[INFO] {self.name} execution time: {exec_time} sec")
 
         final_result.update_total_costs(execution_time=exec_time)
+        circuit_depth = int(ctx.circuit.depth())
+        selection_summary = {
+            "mapper_id": mapper_key,
+            "selected_source": selected_source,
+            "selection_reason": selection_reason,
+            "safeguard_enabled": safeguard_enabled,
+            "comparison_tolerances": {
+                "mapopt_cost_atol": cost_atol,
+                "mapopt_cost_rtol": cost_rtol,
+            },
+            "baseline": (
+                _mapopt_metric_snapshot(baseline_evaluated.total_costs, circuit_depth)
+                if baseline_evaluated is not None
+                else None
+            ),
+            "candidate": _mapopt_metric_snapshot(
+                candidate_evaluated.total_costs,
+                circuit_depth,
+            ),
+            "beam_tie_statistics": beam_stats,
+        }
+
+        selected_raw.save_records(f"{base_path}_raw.json", dump_type="raw")
+        final_result.save_records(f"{base_path}_evaluated.json", dump_type="evaluated")
+        _atomic_write_json(
+            Path(f"{base_path}_mapopt_selection.json"),
+            selection_summary,
+        )
+        if selected_source == "no_op":
+            candidate_raw.save_records(
+                f"{base_path}_mapopt_candidate_raw.json",
+                dump_type="raw",
+            )
+            candidate_evaluated.save_records(
+                f"{base_path}_mapopt_candidate_evaluated.json",
+                dump_type="evaluated",
+            )
+
         if self._checkpoint_enabled(ctx):
-            self._write_checkpoint_manifest_entry(
-                self._checkpoint_dir(ctx),
+            self._save_checkpoint_records(
+                ctx,
                 "NAVI",
                 "NAVI_raw.json",
+                selected_raw,
                 execution_time=exec_time,
             )
-        final_result.save_records(f"{base_path}_evaluated.json", dump_type="evaluated")
+            checkpoint_dir = self._checkpoint_dir(ctx)
+            final_result.save_records(
+                str(checkpoint_dir / "NAVI_evaluated.json"),
+                dump_type="evaluated",
+            )
+            self._write_checkpoint_manifest_entry(
+                checkpoint_dir,
+                "NAVI-evaluated",
+                "NAVI_evaluated.json",
+            )
+            _atomic_write_json(
+                checkpoint_dir / "NAVI_mapopt_selection.json",
+                selection_summary,
+            )
+            self._write_checkpoint_manifest_entry(
+                checkpoint_dir,
+                "NAVI-MapOpt-Selection",
+                "NAVI_mapopt_selection.json",
+            )
+            if selected_source == "no_op":
+                candidate_raw.save_records(
+                    str(checkpoint_dir / "NAVI_mapopt_candidate_raw.json"),
+                    dump_type="raw",
+                )
+                candidate_evaluated.save_records(
+                    str(checkpoint_dir / "NAVI_mapopt_candidate_evaluated.json"),
+                    dump_type="evaluated",
+                )
+                self._write_checkpoint_manifest_entry(
+                    checkpoint_dir,
+                    "NAVI-MapOpt-Candidate-Raw",
+                    "NAVI_mapopt_candidate_raw.json",
+                )
+                self._write_checkpoint_manifest_entry(
+                    checkpoint_dir,
+                    "NAVI-MapOpt-Candidate-Evaluated",
+                    "NAVI_mapopt_candidate_evaluated.json",
+                )
         return final_result
 
     def _finish_compile_from_ctx(
@@ -401,6 +1069,9 @@ class NAVI(Compiler):
         )
         if override_mapper_id is not None:
             selected_mapper_id = str(override_mapper_id).lower()
+        elif ctx.network.net_type == "all_to_all":
+            # MapOpt 对 all-to-all 网络影响很小，scalability 测试中跳过排列搜索。
+            selected_mapper_id = "direct"
         else:
             selected_mapper_id = str(ctx.config.get("multi_record_mapper", "boundeddp_neighbor")).lower()
             if (
@@ -607,6 +1278,65 @@ class NAVI(Compiler):
 
         return P
 
+    def _step_select_slicing(self, ctx: CompilationContext) -> list[tuple[int, int]]:
+        """Select the configured slicing strategy over the shared P table."""
+        strategy = self._resolve_slice_strategy(ctx.config)
+        start_time = time.perf_counter()
+
+        if strategy == "dp":
+            subc_ranges = self._step_build_slicing_table(ctx)
+        elif strategy == "greedy_table":
+            subc_ranges = self._step_build_greedy_slicing(ctx)
+        else:  # Guard against future registry/config drift.
+            raise AssertionError(f"Unhandled slice strategy: {strategy}")
+
+        ctx.slice_strategy = strategy
+        ctx.slice_planning_time_sec = time.perf_counter() - start_time
+        log(
+            f"[slice_planner] strategy={strategy}, layers={len(ctx.P_table)}, "
+            f"segments={len(subc_ranges)}, "
+            f"time_sec={ctx.slice_planning_time_sec:.6f}"
+        )
+        return subc_ranges
+
+    def _step_build_greedy_slicing(
+        self,
+        ctx: CompilationContext,
+    ) -> list[tuple[int, int]]:
+        """Choose the longest zero-cut-feasible prefix at each slice boundary."""
+        P = ctx.P_table
+        num_depths = len(P)
+        if num_depths == 0:
+            return []
+
+        for i in range(num_depths):
+            if len(P[i][i]) == 0:
+                raise RuntimeError(
+                    f"[ERROR] P[{i}][{i}] is empty. Cannot build greedy slicing."
+                )
+
+        subc_ranges: list[tuple[int, int]] = []
+        i = 0
+        while i < num_depths:
+            r = i
+            while r + 1 < num_depths and len(P[i][r + 1]) > 0:
+                r += 1
+            subc_ranges.append((i, r))
+            i = r + 1
+
+        next_left = 0
+        for left, right in subc_ranges:
+            assert left == next_left, "Greedy slicing must be contiguous."
+            assert left <= right < num_depths, "Greedy slicing range is invalid."
+            assert len(P[left][right]) > 0, "Greedy slicing selected an infeasible range."
+            assert (
+                right == num_depths - 1 or len(P[left][right + 1]) == 0
+            ), "Greedy slicing range is not right-maximal."
+            next_left = right + 1
+        assert next_left == num_depths, "Greedy slicing must cover every layer."
+
+        return subc_ranges
+
     def _step_build_slicing_table(self, ctx: CompilationContext) -> list[Any]:
         """
         Build S and T tables and extract subc_ranges.
@@ -663,6 +1393,7 @@ class NAVI(Compiler):
         """
         blocks = ctx.subc_ranges
         K = len(blocks)
+        ctx.commopt_full_span_won = False
 
         beam_width = int(ctx.config.get("hybrid_beam_width", 1))
         # 最多合并多少个block
@@ -671,6 +1402,9 @@ class NAVI(Compiler):
         merge_probe_budget = int(ctx.config.get("hybrid_merge_probe_budget", 10))
         # 最多探查几个pos
         pos_probe_budget = int(ctx.config.get("hybrid_pos_probe_budget", K))
+        full_span_safeguard = bool(
+            ctx.config.get("hybrid_full_span_safeguard", True)
+        )
         # 仅当候选显著超出 beam_width 时才做前向剪枝，减少重复排序开销。
         prune_trigger_ratio = int(ctx.config.get("hybrid_prune_trigger_ratio", 5))
         # 防止数值输入有误
@@ -686,6 +1420,10 @@ class NAVI(Compiler):
             return MappingRecordList()
 
         eval_network = ctx.network
+        log(
+            "[hybrid] CAT initial_partition=previous_record_partition, "
+            f"full_span_safeguard={full_span_safeguard}"
+        )
 
         original_records: list[MappingRecord] = []
         for idx, (s, e) in enumerate(blocks):
@@ -809,7 +1547,11 @@ class NAVI(Compiler):
                     upper_end = min(K - 1, pos + max_merge_span - 1)
                     sampled_ends = self._sample_budgeted_indices(pos, upper_end, merge_probe_budget)
 
-                    if pos == 0 and (K - 1) not in sampled_ends:
+                    if (
+                        full_span_safeguard
+                        and pos == 0
+                        and (K - 1) not in sampled_ends
+                    ):
                         sampled_ends.append(K - 1)
                         sampled_ends = sorted(set(sampled_ends))
 
@@ -818,11 +1560,12 @@ class NAVI(Compiler):
                             continue
 
                         end_layer = original_records[end].layer_end
+                        is_full_span = pos == 0 and end == K - 1
                         telegate_result = self._try_generate_telegate(
                             ctx,
                             start_layer,
                             end_layer,
-                            prev_partition,
+                            prev_partition=prev_partition,
                         )
 
                         tg_record = copy.deepcopy(telegate_result.records[0])
@@ -837,10 +1580,14 @@ class NAVI(Compiler):
                         merged_cat_ents = base_cat_ents + seg_cat_ents
 
                         candidate_records = base_records + [tg_record]
-                        states.setdefault(end + 1, []).append((merged_epairs, merged_cat_ents, candidate_records))
+                        states.setdefault(end + 1, []).append(
+                            (merged_epairs, merged_cat_ents, candidate_records)
+                        )
 
-                        if pos == 0 and end == K - 1:
-                            full_span_result, full_span_eval_key = _reevaluate_records([tg_record])
+                        if is_full_span and full_span_safeguard:
+                            full_span_result, full_span_eval_key = _reevaluate_records(
+                                [tg_record]
+                            )
                             full_span_telegate_candidate = (
                                 full_span_eval_key,
                                 full_span_result,
@@ -863,6 +1610,14 @@ class NAVI(Compiler):
         if full_span_telegate_candidate is not None and full_span_telegate_candidate[0] < best_eval_key:
             best_eval_key, best_full_span_telegate_result = full_span_telegate_candidate
             result = copy.deepcopy(best_full_span_telegate_result)
+
+        if K > 1 and len(result.records) == 1:
+            only_record = result.records[0]
+            ctx.commopt_full_span_won = (
+                only_record.mapping_type in {"cat", "telegate"}
+                and only_record.layer_start == original_records[0].layer_start
+                and only_record.layer_end == original_records[-1].layer_end
+            )
 
         ctx.telegate_optimized = True
 
@@ -1327,7 +2082,7 @@ def evaluate_navi_checkpoints_from_config(
             f"{eval_time:.6f} sec"
         )
         if execution_time is not None:
-            evaluated.update_total_costs(execution_time=execution_time)
+            evaluated.update_total_costs(execution_time=execution_time + eval_time)
         result_info[spec.name] = {
             "F_eff": np.exp(evaluated.total_costs.total_fidelity_log_sum / task_info["Depth"]),
             **evaluated.total_costs.to_dict(),

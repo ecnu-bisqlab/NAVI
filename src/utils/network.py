@@ -25,6 +25,8 @@ class Network:
 
     def __init__(self, network_config: dict, backend_list: list[Backend], build_all_to_all_copy: bool = True):
         self.num_backends = len(backend_list)
+        self.seed = network_config.get("seed")
+        self._rng = random.Random(self.seed)
         self.network_coupling = self._build_network_coupling(network_config)
         self.network_graph = self._build_weighted_network_graph(self.network_coupling)
         # 计算telegate的保真度和跳数
@@ -94,18 +96,18 @@ class Network:
 
         if self.net_type == 'all_to_all':
             network_coupling = {
-                (i, j): random.uniform(self.fidelity_range[0], self.fidelity_range[1])
+                (i, j): self._rng.uniform(self.fidelity_range[0], self.fidelity_range[1])
                 for i in range(self.num_backends)
                 for j in range(i+1, self.num_backends)
             }
         elif self.net_type == 'chain':
             network_coupling = {
-                (i, i + 1): random.uniform(self.fidelity_range[0], self.fidelity_range[1])
+                (i, i + 1): self._rng.uniform(self.fidelity_range[0], self.fidelity_range[1])
                 for i in range(self.num_backends - 1)
             }
         elif self.net_type == 'star':
             network_coupling = {
-                (0, i): random.uniform(self.fidelity_range[0], self.fidelity_range[1])
+                (0, i): self._rng.uniform(self.fidelity_range[0], self.fidelity_range[1])
                 for i in range(1, self.num_backends)
             }
         elif self.net_type == 'mesh_grid':
@@ -114,10 +116,10 @@ class Network:
             
             for row in range(n_rows):
                 for col in range(n_cols - 1):
-                    network_coupling[(row * n_cols + col, row * n_cols + col + 1)] = random.uniform(self.fidelity_range[0], self.fidelity_range[1])
+                    network_coupling[(row * n_cols + col, row * n_cols + col + 1)] = self._rng.uniform(self.fidelity_range[0], self.fidelity_range[1])
             for row in range(n_rows - 1):
                 for col in range(n_cols):
-                    network_coupling[(row * n_cols + col, (row + 1) * n_cols + col)] = random.uniform(self.fidelity_range[0], self.fidelity_range[1])
+                    network_coupling[(row * n_cols + col, (row + 1) * n_cols + col)] = self._rng.uniform(self.fidelity_range[0], self.fidelity_range[1])
         elif self.net_type == 'self_defined':
             network_coupling = network_config.get('network_coupling', {})
             self.fidelity_range = [
@@ -420,6 +422,7 @@ class Network:
             print(f"  Backend {u} <-> Backend {v}: Fidelity = {fidelity:.4f}")
         print(f"Hop weight: {self.hop_weight}")
         print(f"Fidelity range: {self.fidelity_range}")
+        print(f"Network random seed: {self.seed}")
         print(f"Backend sizes: {self.backend_sizes}")
         print(f"Backend sizes (full): {self.backend_sizes_full}")
         # 输出每个backend的coupling map

@@ -1,6 +1,10 @@
 .vscode/
 .codex
 config.json
-tests/
+tests/*
+!tests/test_navi_ablation.py
+!tests/test_navi_slice_strategy.py
+!tests/test_oee_iteration_analysis.py
 outputs/
 __pycache__/
+*.log

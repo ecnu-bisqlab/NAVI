@@ -152,12 +152,13 @@ class MaxMatchPartitionAssigner(PartitionAssigner):
             # 使用匈牙利算法找到最大权匹配（最大化交集大小）
             prev_idx, curr_idx = linear_sum_assignment(weights, maximize=True)
             
-            # 创建新的当前时间步分区方案，按匹配结果重新排序
+            # 创建新的当前时间步分区方案，按匹配结果重新排序。
+            # linear_sum_assignment 返回的是 (prev_position, curr_group)
+            # 匹配对，因此当前分组 curr_group 应继承上一时间步的
+            # prev_position 标签。
             new_curr_assign = [[] for _ in range(num_qpus)]
-            for i in range(num_qpus):
-                # 将当前时间步的逻辑QPU j 映射到新的逻辑QPU位置 curr_idx[i]
-                # print(f"Time step {t}: matched prev QPU {prev_idx[i]} with curr QPU {curr_idx[i]}, intersection size = {weights[prev_idx[i]][curr_idx[i]]}")
-                new_curr_assign[curr_idx[i]] = curr_assign[prev_idx[i]]
+            for prev_position, curr_group in zip(prev_idx, curr_idx):
+                new_curr_assign[int(prev_position)] = curr_assign[int(curr_group)]
                 
             # 更新当前时间步的分区方案
             partition_plan[t] = new_curr_assign
@@ -287,7 +288,9 @@ class PartitionAssignerFactory:
     _registry = {
         "direct": "DirectPartitionAssigner",
         "max_match": "MaxMatchPartitionAssigner",
-        "global_max_match": "GlobalMaxMatchPartitionAssigner"
+        # "global_max_match": "GlobalMaxMatchPartitionAssigner",
+        # Disabled intentionally: corrected max_match reaches the same matching
+        # objective without the factorial global dynamic program.
     }
     
     @classmethod
@@ -336,4 +339,3 @@ class PartitionAssignerFactory:
         :return: 可用分配器类型列表
         """
         return list(cls._registry.keys())
-

@@ -722,9 +722,14 @@ class CompilerUtils:
         network: Network,
         compiler_name: str,
         timestamp: str,
+        output_folder: str = "./outputs",
     ) -> str:
         net_type = getattr(network, "net_type", "unknown")
-        return f"./outputs/{circuit_name}/{circuit_name}_{network.name}_{net_type}_{compiler_name}_{timestamp}"
+        return os.path.join(
+            output_folder,
+            circuit_name,
+            f"{circuit_name}_{network.name}_{net_type}_{compiler_name}_{timestamp}",
+        )
 
     @staticmethod
     def build_circuit_layers(circuit: QuantumCircuit) -> list[list[Any]]:
@@ -2230,7 +2235,10 @@ class CompilerUtils:
                         costs, u, v, int(min_weight), network
                     )
 
-        for u, v, data in list(G.edges(data=True)):
+        # Execute residual one-way moves from sinks back toward sources.  A plain
+        # node-order traversal can try to land an incoming payload on a full QPU
+        # before that QPU's outgoing payload has released its physical slot.
+        for u, v, data in CompilerUtils._remaining_teledata_edges_sink_first(G):
             qubits_to_move = data["qubits"]
 
             if logical_phy_map:
@@ -2493,6 +2501,33 @@ class CompilerUtils:
             if mapped_qpu == qpu_id and phy_id is not None:
                 occupied.add(int(phy_id))
         return occupied
+
+    @staticmethod
+    def _remaining_teledata_edges_sink_first(
+        graph: nx.DiGraph,
+    ) -> list[tuple[int, int, dict[str, Any]]]:
+        """Order residual one-way moves so outgoing payload slots are freed first.
+
+        Reciprocal swaps and directed cycles have already been removed before this
+        helper is called, so the residual movement graph must be a DAG. Processing
+        its sources in reverse topological order prevents a temporarily full QPU
+        from receiving payloads before its own outgoing payloads vacate their comp
+        slots. This matters for uneven partitions such as SwapTest's 79 logical
+        qubits on four 20-qubit QPUs.
+        """
+        if not nx.is_directed_acyclic_graph(graph):
+            raise RuntimeError(
+                "[TELEDATA_LOCAL] residual movement graph still contains a cycle"
+            )
+
+        ordered_edges: list[tuple[int, int, dict[str, Any]]] = []
+        for source in reversed(list(nx.topological_sort(graph))):
+            for _, destination, data in sorted(
+                graph.out_edges(source, data=True),
+                key=lambda edge: int(edge[1]),
+            ):
+                ordered_edges.append((int(source), int(destination), data))
+        return ordered_edges
 
     @staticmethod
     def _choose_smallest_free_phy(

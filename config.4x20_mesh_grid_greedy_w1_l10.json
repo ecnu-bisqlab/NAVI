@@ -1,0 +1,36 @@
+{
+    "experiment_id": "4x20_mesh_grid_greedy_w1_l10_260901",
+    "device_properties_folder": "./data/device_properties/ibm/",
+    "output_folder": "./outputs/4x20_mesh_grid_greedy_w1_l10/260901/artifacts/",
+    "compiler_modules": ["src.baselines", "src.navi"],
+    "compiler_ids": ["staticoee", "fgproee", "wbcp", "autocomm", "navi"],
+    "navi_checkpoint": {
+        "enabled": false
+    },
+    "compiler_config": {
+        "navi": {
+            "ablation_mode": false,
+            "slice_strategy": "greedy_table",
+            "partition_assigner": "max_match",
+            "hybrid_beam_width": 1,
+            "hybrid_max_merge_span": 10,
+            "hybrid_merge_probe_budget": 15,
+            "hybrid_full_span_safeguard": true,
+            "multi_record_mapper": "boundeddp_neighbor",
+            "beam_width": 1,
+            "mapopt_dominance_safeguard": true,
+            "mapopt_cost_atol": 1e-12,
+            "mapopt_cost_rtol": 1e-12,
+            "mapopt_retain_boundary_ties": true,
+            "min_atomic_zero_cut_subcircuits": 0,
+            "telegate_cache": false,
+            "telegate_cache_mode": "strict",
+            "iteration": 50
+        }
+    },
+    "network_config": {
+        "fidelity_range": [0.90, 0.93],
+        "comm_slot_reserve": 2,
+        "seed": 42
+    }
+}

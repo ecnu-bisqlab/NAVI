@@ -5,6 +5,8 @@ import numpy as np
 import itertools
 from typing import Any, Optional
 import copy
+from functools import cmp_to_key
+import math
 from math import inf
 from pprint import pprint
 import networkx as nx
@@ -16,6 +18,71 @@ from qiskit import QuantumCircuit
 from ..compiler import MappingRecord, MappingRecordList, CompilerUtils, ExecCosts
 from ..compiler.compiler_utils import CommOp
 from ..utils import Network
+
+
+def compare_mapopt_costs(
+        left: ExecCosts,
+        right: ExecCosts,
+        *,
+        atol: float = 1e-12,
+        rtol: float = 1e-12,
+    ) -> int:
+    """Compare MapOpt costs without letting floating-point tails break ties."""
+    left_loss = float(left.total_fidelity_loss)
+    right_loss = float(right.total_fidelity_loss)
+    tolerance = float(atol) + float(rtol) * max(abs(left_loss), abs(right_loss))
+    if left_loss < right_loss - tolerance:
+        return -1
+    if left_loss > right_loss + tolerance:
+        return 1
+    if int(left.epairs) < int(right.epairs):
+        return -1
+    if int(left.epairs) > int(right.epairs):
+        return 1
+    return 0
+
+
+def retain_mapopt_boundary_ties(
+        indexed_records: list[tuple[int, MappingRecord]],
+        beam_width: int,
+        *,
+        atol: float = 1e-12,
+        rtol: float = 1e-12,
+        retain_boundary_ties: bool = True,
+    ) -> tuple[list[tuple[int, MappingRecord]], bool]:
+    """Sort a beam and retain the complete cost tie at its cutoff."""
+    if not indexed_records:
+        return [], False
+
+    def _compare(
+            left: tuple[int, MappingRecord],
+            right: tuple[int, MappingRecord],
+        ) -> int:
+        result = compare_mapopt_costs(
+            left[1].costs,
+            right[1].costs,
+            atol=atol,
+            rtol=rtol,
+        )
+        if result != 0:
+            return result
+        # Deterministic only: the complete boundary tie is retained below.
+        return (left[0] > right[0]) - (left[0] < right[0])
+
+    ordered = sorted(indexed_records, key=cmp_to_key(_compare))
+    width = max(1, int(beam_width))
+    if len(ordered) <= width:
+        return ordered, False
+    if not retain_boundary_ties:
+        return ordered[:width], False
+
+    cutoff = ordered[width - 1][1].costs
+    retained = ordered[:width]
+    for item in ordered[width:]:
+        if compare_mapopt_costs(item[1].costs, cutoff, atol=atol, rtol=rtol) != 0:
+            break
+        retained.append(item)
+    return retained, len(retained) > width
 
 class Mapper(ABC):
     """
@@ -963,6 +1030,15 @@ class NeighborhoodBoundedDPMapper(Mapper):
 
         mapper_cfg = config or {}
         beam_width = int(mapper_cfg.get("beam_width", 1))
+        cost_atol = float(mapper_cfg.get("mapopt_cost_atol", 1e-12))
+        cost_rtol = float(mapper_cfg.get("mapopt_cost_rtol", 1e-12))
+        retain_boundary_ties = bool(
+            mapper_cfg.get("mapopt_retain_boundary_ties", True)
+        )
+        if not math.isfinite(cost_atol) or cost_atol < 0:
+            raise ValueError("mapopt_cost_atol must be a finite nonnegative number")
+        if not math.isfinite(cost_rtol) or cost_rtol < 0:
+            raise ValueError("mapopt_cost_rtol must be a finite nonnegative number")
 
         # 根据网络类型自适应设置mapping预算：
         # - all-to-all（或等效max_hop=1）默认较小预算
@@ -993,6 +1069,7 @@ class NeighborhoodBoundedDPMapper(Mapper):
         all_perms = list(itertools.permutations(range(n_physical)))
         num_states = len(all_perms)
         perm_to_idx = {perm: idx for idx, perm in enumerate(all_perms)}
+        identity_idx = perm_to_idx[tuple(range(n_physical))]
 
         # 预计算“一次交换”邻域，避免每次扩展都重复 list/tuple 构造与字典查找。
         one_swap_neighbors: list[list[int]] = [[] for _ in range(num_states)]
@@ -1150,6 +1227,8 @@ class NeighborhoodBoundedDPMapper(Mapper):
         back: list[list[int]] = []
         # 每层保留的【原始perm idx】列表：map_kept[t][kept_idx] = original_perm_idx
         map_kept_to_original: list[list[int]] = []
+        retained_state_count_per_group: list[int] = []
+        boundary_tie_expansion_count = 0
 
         # ==========================
         # t=0 初始化（第一层）
@@ -1161,7 +1240,6 @@ class NeighborhoodBoundedDPMapper(Mapper):
         if num_states <= max_candidate_states:
             t0_candidate_indices = list(range(num_states))
         else:
-            identity_idx = perm_to_idx[tuple(range(n_physical))]
             t0_candidate_indices = _build_candidate_indices([identity_idx], max_candidate_states)
 
         # 计算 t=0 候选状态
@@ -1182,23 +1260,29 @@ class NeighborhoodBoundedDPMapper(Mapper):
                 circuit=circuit,
                 circuit_layers=circuit_layers,
             )
-            t0_full.append(MappingRecord(
+            initial_record = MappingRecord(
                 partition=last_partition,
                 costs=costs,
                 logical_phy_map=logical_phy_map,
                 comm_phy_map=comm_phy_map,
-            ))
+            )
+            initial_record.mapopt_mapping_change_count = int(state_idx != identity_idx)
+            t0_full.append(initial_record)
 
         # --------------------------
         # t0 束搜索：保留 top-K
         # --------------------------
-        t0_sorted = sorted(
-            enumerate(t0_full),
-            key=lambda x: (x[1].costs.total_fidelity_loss, x[1].costs.epairs)
+        t0_sorted, expanded = retain_mapopt_boundary_ties(
+            list(enumerate(t0_full)),
+            beam_width,
+            atol=cost_atol,
+            rtol=cost_rtol,
+            retain_boundary_ties=retain_boundary_ties,
         )
-        t0_sorted = t0_sorted[:beam_width]
+        boundary_tie_expansion_count += int(expanded)
         kept_indices_t0 = [t0_candidate_indices[i] for i, _ in t0_sorted]
         kept_records_t0 = [r for _, r in t0_sorted]
+        retained_state_count_per_group.append(len(kept_records_t0))
 
         prev_bests = kept_records_t0 # 记录前序最好的MappingRecord
         map_kept_to_original.append(kept_indices_t0)
@@ -1224,6 +1308,7 @@ class NeighborhoodBoundedDPMapper(Mapper):
 
                 best_record = None
                 best_prev_kept_idx = -1
+                best_mapping_change_count = 0
 
                 # 只遍历上一层保留的K个状态
                 for prev_kept_idx in range(len(prev_bests)):
@@ -1244,18 +1329,35 @@ class NeighborhoodBoundedDPMapper(Mapper):
                         circuit_layers=circuit_layers,
                     )
                     curr_total_costs += group_costs
+                    prev_original_idx = prev_original_indices[prev_kept_idx]
+                    mapping_change_count = int(
+                        getattr(prev_record, "mapopt_mapping_change_count", 0)
+                    ) + int(prev_original_idx != curr_idx)
 
                     # 更新最优
-                    if best_record is None or \
-                        (curr_total_costs.total_fidelity_loss, curr_total_costs.epairs) < \
-                        (best_record.costs.total_fidelity_loss, best_record.costs.epairs):
+                    comparison = (
+                        -1
+                        if best_record is None
+                        else compare_mapopt_costs(
+                            curr_total_costs,
+                            best_record.costs,
+                            atol=cost_atol,
+                            rtol=cost_rtol,
+                        )
+                    )
+                    if comparison < 0 or (
+                        comparison == 0
+                        and mapping_change_count < best_mapping_change_count
+                    ):
                         best_record = MappingRecord(
                             partition=last_partition,
                             costs=curr_total_costs,
                             logical_phy_map=logical_phy_map,
                             comm_phy_map=comm_phy_map,
                         )
+                        best_record.mapopt_mapping_change_count = mapping_change_count
                         best_prev_kept_idx = prev_kept_idx
+                        best_mapping_change_count = mapping_change_count
 
                 assert best_record is not None
                 curr_bests.append(best_record)
@@ -1264,11 +1366,14 @@ class NeighborhoodBoundedDPMapper(Mapper):
             # --------------------------
             # 束搜索：当前层排序 + 裁剪 top-K
             # --------------------------
-            curr_sorted = sorted(
-                enumerate(curr_bests),
-                key=lambda x: (x[1].costs.total_fidelity_loss, x[1].costs.epairs)
+            curr_sorted, expanded = retain_mapopt_boundary_ties(
+                list(enumerate(curr_bests)),
+                beam_width,
+                atol=cost_atol,
+                rtol=cost_rtol,
+                retain_boundary_ties=retain_boundary_ties,
             )
-            curr_sorted = curr_sorted[:beam_width]
+            boundary_tie_expansion_count += int(expanded)
 
             kept_original_indices = [candidate_indices[i] for i, _ in curr_sorted]
             kept_records = [r for _, r in curr_sorted]
@@ -1280,6 +1385,7 @@ class NeighborhoodBoundedDPMapper(Mapper):
             # 更新滚动数组
             prev_bests = kept_records
             map_kept_to_original.append(kept_original_indices)
+            retained_state_count_per_group.append(len(kept_records))
             curr_bests = []
 
             subc_end_time = time.time()
@@ -1295,8 +1401,17 @@ class NeighborhoodBoundedDPMapper(Mapper):
         # 最后一层最优 kept_idx
         best_last_kept = 0
         for idx, r in enumerate(prev_bests):
-            if (r.costs.total_fidelity_loss, r.costs.epairs) < \
-               (prev_bests[best_last_kept].costs.total_fidelity_loss, prev_bests[best_last_kept].costs.epairs):
+            comparison = compare_mapopt_costs(
+                r.costs,
+                prev_bests[best_last_kept].costs,
+                atol=cost_atol,
+                rtol=cost_rtol,
+            )
+            if comparison < 0 or (
+                comparison == 0
+                and int(getattr(r, "mapopt_mapping_change_count", 0))
+                < int(getattr(prev_bests[best_last_kept], "mapopt_mapping_change_count", 0))
+            ):
                 best_last_kept = idx
 
         # 存储每层的原始 perm idx
@@ -1351,11 +1466,24 @@ class NeighborhoodBoundedDPMapper(Mapper):
         final_record_list = self._reevaluate_mapping_record_list(
             final_record_list, circuit, circuit_layers, network, config=config
         )
+        final_record_list.mapopt_beam_stats = {
+            "normal_beam_width": int(beam_width),
+            "retained_state_count_per_group": retained_state_count_per_group,
+            "boundary_tie_expansion_count": int(boundary_tie_expansion_count),
+            "maximum_effective_beam_width": max(retained_state_count_per_group),
+            "selected_mapping_change_count": int(
+                getattr(prev_bests[best_last_kept], "mapopt_mapping_change_count", 0)
+            ),
+        }
 
         end_time = time.time()
         print(f"[INFO] Neighborhood Bounded DP 运行完成 | 耗时={end_time - start_time:.2f}s")
         print(f"[INFO] Neighborhood Bounded DP 运行完成 | 耗时={end_time - start_time:.2f}s", file=sys.stderr)
         print(f"[INFO] [Neighborhood Bounded DP Mapper] final mapping perm sequence (from DP backtrace): {final_perm_sequence}")
+        print(
+            "[INFO] [Neighborhood Bounded DP Mapper] beam tie stats: "
+            f"{final_record_list.mapopt_beam_stats}"
+        )
 
         return final_record_list
 

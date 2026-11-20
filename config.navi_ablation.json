@@ -1,0 +1,41 @@
+{
+    "device_properties_folder": "./data/device_properties/ibm/",
+    "output_folder": "./outputs/",
+    "compiler_modules": ["src.navi"],
+    "compiler_ids": ["navi"],
+    "navi_checkpoint": {
+        "enabled": true,
+        "evaluations": [
+            {
+                "id": "navi_td",
+                "name": "NAVI-Td",
+                "source": "NAVI-Td"
+            },
+            {
+                "id": "navi_hy",
+                "name": "NAVI-Hy",
+                "source": "NAVI-Hy"
+            }
+        ]
+    },
+    "compiler_config": {
+        "navi": {
+            "ablation_mode": true,
+            "slice_strategy": "dp",
+            "partition_assigner": "max_match",
+            "multi_record_mapper": "boundeddp_neighbor",
+            "beam_width": 4,
+            "max_candidate_states": 24,
+            "max_neighbor_swaps": 1,
+            "mapopt_cost_atol": 1e-12,
+            "mapopt_cost_rtol": 1e-12,
+            "mapopt_retain_boundary_ties": true,
+            "mapopt_dominance_safeguard": true
+        }
+    },
+    "network_config": {
+        "fidelity_range": [0.90, 0.93],
+        "comm_slot_reserve": 2,
+        "seed": 42
+    }
+}

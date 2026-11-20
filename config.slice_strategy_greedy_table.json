@@ -1,0 +1,21 @@
+{
+    "experiment_id": "slice_strategy_greedy_table",
+    "device_properties_folder": "./data/device_properties/ibm/",
+    "output_folder": "./outputs/slice_strategy_comparison/greedy_table/",
+    "compiler_modules": ["src.navi"],
+    "compiler_ids": ["navi"],
+    "navi_checkpoint": {
+        "enabled": false
+    },
+    "compiler_config": {
+        "navi": {
+            "ablation_mode": false,
+            "slice_strategy": "greedy_table"
+        }
+    },
+    "network_config": {
+        "fidelity_range": [0.90, 0.93],
+        "comm_slot_reserve": 2,
+        "seed": 42
+    }
+}

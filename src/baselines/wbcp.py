@@ -26,7 +26,28 @@ class WBCP(Compiler):
     @property
     def name(self) -> str:
         return "WBCP"
-    
+
+    @staticmethod
+    def _resolve_window_plan(
+        num_depths: int,
+        config: Optional[dict[str, Any]] = None,
+    ) -> tuple[int, int]:
+        """Resolve window length/count, preserving the legacy default exactly."""
+        requested_segments = (config or {}).get("num_segments")
+        if requested_segments is None:
+            win_len = max(30, min(num_depths // 20, 500))
+            if win_len == 0:
+                win_len = num_depths
+        else:
+            requested_segments = int(requested_segments)
+            if requested_segments <= 0:
+                raise ValueError("WBCP num_segments must be a positive integer.")
+            win_len = max(
+                30,
+                min(math.ceil(num_depths / requested_segments), 500),
+            )
+        return win_len, math.ceil(num_depths / win_len)
+
     def compile(self, 
                 circuit: QuantumCircuit, 
                 network: Network, 
@@ -77,10 +98,7 @@ class WBCP(Compiler):
         circuit_layers = list(circuit_dag.layers())
 
         num_depths = circuit.depth()
-        win_len = max(30, min(num_depths // 20, 500)) # 范围在[30, 500]，过长的线路设置成500
-        if win_len == 0:
-            win_len = num_depths
-        num_subc = math.ceil(num_depths / win_len)
+        win_len, num_subc = self._resolve_window_plan(num_depths, config)
 
         # split qc into 'num_subc' sub-circuits
         # build the qubit interaction graph for each sub-circuit

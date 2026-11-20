@@ -1,0 +1,28 @@
+{
+    "device_properties_folder": "./data/device_properties/ibm/",
+    "output_folder": "./outputs/commopt_parameter_analysis",
+    "compiler_modules": ["src.navi"],
+    "compiler_ids": ["navi"],
+    "navi_checkpoint": {
+        "enabled": false
+    },
+    "compiler_config": {
+        "navi": {
+            "ablation_mode": false,
+            "slice_strategy": "greedy_table",
+            "partition_assigner": "max_match",
+            "hybrid_beam_width": 1,
+            "hybrid_max_merge_span": 10,
+            "hybrid_merge_probe_budget": 15,
+            "min_atomic_zero_cut_subcircuits": 15,
+            "telegate_cache": false,
+            "telegate_cache_mode": "strict",
+            "iteration": 50
+        }
+    },
+    "network_config": {
+        "fidelity_range": [0.90, 0.93],
+        "comm_slot_reserve": 2,
+        "seed": 42
+    }
+}

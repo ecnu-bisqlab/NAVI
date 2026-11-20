@@ -4,6 +4,7 @@ from .mapper import MapperFactory
 from .navi_compiler import (
     CompilationContext,
     HybridSearchState,
+    InsufficientAtomicZeroCutSubcircuitsError,
     NAVICheckpointEvaluationResult,
     NAVICheckpointEvaluationSpec,
     NAVI,
@@ -16,6 +17,7 @@ __all__ = [
     "MapperFactory",
     "CompilationContext",
     "HybridSearchState",
+    "InsufficientAtomicZeroCutSubcircuitsError",
     "NAVI",
     "NAVICheckpointEvaluationResult",
     "NAVICheckpointEvaluationSpec",

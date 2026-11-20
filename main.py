@@ -3,18 +3,60 @@ import time
 import datetime
 import traceback
 import io
+import json
+import pickle
 from pprint import pprint
 from pathlib import Path
 import numpy as np
 
 from src.utils import log, get_args, get_config, select_circuit, write_compiler_results_to_csv, Backend, Network
 from src.compiler import Compiler, CompilerFactory
-from src.navi import evaluate_navi_checkpoints_from_config, navi_checkpoint_enabled
+from src.navi import (
+    InsufficientAtomicZeroCutSubcircuitsError,
+    evaluate_navi_checkpoints_from_config,
+    navi_checkpoint_enabled,
+)
+
+
+def _load_navi_shared_prefix(path: str, args):
+    bundle_path = Path(path).resolve()
+    with bundle_path.open("rb") as handle:
+        bundle = pickle.load(handle)
+    if not isinstance(bundle, dict) or bundle.get("bundle_version") != 1:
+        raise ValueError(f"Unsupported NAVI shared-prefix bundle: {bundle_path}")
+    metadata = bundle.get("metadata")
+    shared_context = bundle.get("shared_context")
+    task_info = bundle.get("task_info")
+    if not isinstance(metadata, dict) or shared_context is None or not isinstance(task_info, dict):
+        raise ValueError(f"Incomplete NAVI shared-prefix bundle: {bundle_path}")
+
+    expected = {
+        "benchmark": args.circuit_name,
+        "circuit_seed": args.circuit_seed,
+        "requested_qubit_count": args.qubit_count,
+        "requested_qpu_count": args.core_count,
+        "requested_qpu_capacities": args.core_capacity,
+        "network_topology": args.network,
+        "backend": args.backend_name,
+        "calibration_date": args.date,
+    }
+    mismatches = {
+        key: {"bundle": metadata.get(key), "requested": value}
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(
+            "NAVI shared-prefix inputs do not match this run: "
+            + json.dumps(mismatches, sort_keys=True)
+        )
+    return bundle_path, metadata, shared_context, task_info
 
 def _build_compile_config(global_config: dict, compiler: Compiler, circuit_name: str) -> dict:
     compiler_config = global_config.get("compiler_config", {})
     return {
         "circuit_name": circuit_name,
+        "_output_folder": str(global_config.get("output_folder", "outputs")),
         **global_config.get("compile_config", {}),
         **compiler_config.get("common", {}),
         **compiler_config.get(compiler.compiler_id, {}),
@@ -26,6 +68,8 @@ def _ordered_result_info(result_info: dict[str, dict[str, float]]) -> dict[str, 
         "FGP-rOEE",
         "AutoComm",
         "WBCP",
+        "NAVI-Td",
+        "NAVI-Hy",
         "NAVI",
     ]
     ordered: dict[str, dict[str, float]] = {}
@@ -44,6 +88,15 @@ def _build_log_path(global_config: dict, circuit_name: str, args, timestamp: str
 
 
 def _build_output_csv_path(global_config: dict, args, timestamp: str | None = None) -> str:
+    custom_output_csv = getattr(args, "output_csv", None)
+    if custom_output_csv:
+        custom_path = Path(custom_output_csv)
+        if custom_path.is_absolute():
+            return str(custom_path)
+        return str(
+            Path(str(global_config.get("output_folder", "outputs"))) / custom_path
+        )
+
     if timestamp is None:
         date_prefix = datetime.datetime.now().strftime("%y%m%d")
     else:
@@ -72,47 +125,59 @@ def _switch_stdout_to_log_file(
 def main(args, timestamp: str | None = None, initial_stdout_buffer: io.StringIO | None = None):
 
     global_config = get_config(args.global_config_path)
-    network_config = {
-        **global_config.get('network_config', {}),
-        'type': args.network,
-    }
-    comm_slot_reserve = Network.resolve_comm_slot_reserve(network_config, global_config)
-
-    backend_list = []
-    for i in range(args.core_count):
-        sampled_capacity = args.core_capacity[i] + comm_slot_reserve
-        # 将字符串列表转换为datetime对象列表
-        backend_config = {
-            'backend_name': f'{args.backend_name[i]}_sampled_{sampled_capacity}q',
-            'date': datetime.datetime.strptime(args.date[i], "%Y-%m-%d")
+    shared_prefix = None
+    if args.navi_shared_prefix:
+        bundle_path, shared_metadata, shared_context, task_info = _load_navi_shared_prefix(
+            args.navi_shared_prefix,
+            args,
+        )
+        shared_prefix = (shared_metadata, shared_context)
+        network = shared_context.network
+        trans_circ = shared_context.circuit
+        print(
+            "[COMMOPT_SHARED_PREFIX_REUSE] "
+            + json.dumps({
+                "bundle_path": str(bundle_path),
+                "shared_prefix_id": shared_metadata.get("shared_prefix_id"),
+                "shared_prefix_time_sec": shared_metadata.get("shared_prefix_time_sec"),
+                "K": shared_metadata.get("K"),
+            }, sort_keys=True)
+        )
+    else:
+        network_config = {
+            **global_config.get('network_config', {}),
+            'type': args.network,
         }
-        backend = Backend(global_config, backend_config)
-        backend_list.append(backend)
-        # pprint(backend.gate_dict)
+        comm_slot_reserve = Network.resolve_comm_slot_reserve(network_config, global_config)
 
-    if 'fidelity_range' not in network_config:
-        fidelity_range = [0.90, 0.93]
-        network_config['fidelity_range'] = fidelity_range
+        backend_list = []
+        for i in range(args.core_count):
+            sampled_capacity = args.core_capacity[i] + comm_slot_reserve
+            backend_config = {
+                'backend_name': f'{args.backend_name[i]}_sampled_{sampled_capacity}q',
+                'date': datetime.datetime.strptime(args.date[i], "%Y-%m-%d")
+            }
+            backend = Backend(global_config, backend_config)
+            backend_list.append(backend)
 
-    print(f"[INFO] Reserved comm slots per QPU (network_config): {comm_slot_reserve}")
-    print(f"[INFO] Core sampled QPU capacities: {args.core_capacity}")
-    print(f"[INFO] Full QPU capacities (core + reserve): {[c + comm_slot_reserve for c in args.core_capacity]}")
+        if 'fidelity_range' not in network_config:
+            network_config['fidelity_range'] = [0.90, 0.93]
 
-    network = Network(network_config, backend_list)
-    network.print_info()
+        print(f"[INFO] Reserved comm slots per QPU (network_config): {comm_slot_reserve}")
+        print(f"[INFO] Core sampled QPU capacities: {args.core_capacity}")
+        print(f"[INFO] Full QPU capacities (core + reserve): {[c + comm_slot_reserve for c in args.core_capacity]}")
 
-    # 获取basis gate set
-    basis_gates = network.basis_gates
-    two_qubit_gates = network.two_qubit_gates
-
-    # 调用量子线路
-    circ, trans_circ, task_info = select_circuit(args.circuit_name,
-                                                 args.qubit_count,
-                                                 args.core_count,
-                                                 args.core_capacity,
-                                                 basis_gates,
-                                                 two_qubit_gates
-                                                 )
+        network = Network(network_config, backend_list)
+        network.print_info()
+        _, trans_circ, task_info = select_circuit(
+            args.circuit_name,
+            args.qubit_count,
+            args.core_count,
+            args.core_capacity,
+            network.basis_gates,
+            network.two_qubit_gates,
+            circuit_seed=args.circuit_seed,
+        )
 
     # print(circ)
     # print(trans_circ)
@@ -153,6 +218,8 @@ def main(args, timestamp: str | None = None, initial_stdout_buffer: io.StringIO 
     for compiler in compilers:
         log(f"Compiler: [{compiler.name}]")
         compile_config = _build_compile_config(global_config, compiler, circuit_name)
+        compile_config["benchmark"] = args.circuit_name
+        compile_config["circuit_seed"] = args.circuit_seed
         if checkpoint_enabled and compiler.compiler_id == "navi" and checkpoint_dir is not None:
             compile_config["navi_checkpoint_enabled"] = True
             compile_config["navi_checkpoint_dir"] = str(checkpoint_dir)
@@ -160,15 +227,40 @@ def main(args, timestamp: str | None = None, initial_stdout_buffer: io.StringIO 
             navi_evaluator_policy = compile_config.get("evaluator_policy")
         log(f"{compile_config}")
         try:
-            result = compiler.compile(trans_circ, network, compile_config)
+            if shared_prefix is not None:
+                if compiler.compiler_id != "navi":
+                    raise ValueError(
+                        "A NAVI shared-prefix bundle can only be used with compiler_ids=['navi']"
+                    )
+                shared_metadata, shared_context = shared_prefix
+                actual_signature = list(compiler.get_shared_prefix_signature(compile_config))
+                if actual_signature != shared_metadata.get("shared_prefix_signature"):
+                    raise ValueError(
+                        "NAVI shared-prefix configuration mismatch: "
+                        f"bundle={shared_metadata.get('shared_prefix_signature')!r}, "
+                        f"run={actual_signature!r}"
+                    )
+                result = compiler.compile_from_shared_prefix(
+                    shared_context,
+                    compile_config,
+                    shared_prefix_time=float(shared_metadata["shared_prefix_time_sec"]),
+                )
+            else:
+                result = compiler.compile(trans_circ, network, compile_config)
             pprint(result.total_costs)
             result_info[compiler.name] = {
                 "F_eff": np.exp(result.total_costs.total_fidelity_log_sum / task_info["Depth"]),
                 **result.total_costs.to_dict()
             }
+        except InsufficientAtomicZeroCutSubcircuitsError as exc:
+            print(f"[ERROR] Compiler [{compiler.name}] rejected the circuit: {exc}")
+            traceback.print_exc(file=sys.stdout)
+            raise
         except Exception as exc:
             print(f"[ERROR] Compiler [{compiler.name}] failed: {exc}")
             traceback.print_exc(file=sys.stdout)
+            if shared_prefix is not None:
+                raise
 
     try:
         checkpoint_result = evaluate_navi_checkpoints_from_config(

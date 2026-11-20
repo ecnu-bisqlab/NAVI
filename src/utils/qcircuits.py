@@ -34,7 +34,6 @@ SUPPORTED_BENCHMARKS = (
     "CuccaroAdder",
 )
 
-
 def select_circuit(
     name,
     num_qubits,
@@ -42,6 +41,7 @@ def select_circuit(
     qpus,
     basis_gates,
     two_qubit_gates,
+    circuit_seed=None,
 ):
     if name not in SUPPORTED_BENCHMARKS:
         allowed = ", ".join(SUPPORTED_BENCHMARKS)
@@ -53,24 +53,29 @@ def select_circuit(
 
     optimization_level = 3
     if name == "QV":
-        circ = QuantumVolume(num_qubits, 10, seed=26).decompose()
+        circ = QuantumVolume(num_qubits, 10, seed=26 if circuit_seed is None else circuit_seed).decompose()
     elif name == "IQP":
-        circ = iqp_circuit(num_qubits).decompose()
+        circ = iqp_circuit(num_qubits, seed=42 if circuit_seed is None else circuit_seed).decompose()
     elif name == "Random":
-        circ = random_circuit(num_qubits, 10, max_operands=4, seed=42)
+        circ = random_circuit(
+            num_qubits,
+            10,
+            max_operands=4,
+            seed=42 if circuit_seed is None else circuit_seed,
+        )
     elif name == "QFTAdder":
         circ = qft_adder(num_qubits)
     elif name == "PQC":
-        circ = pqc(num_qubits).decompose()
+        circ = pqc(num_qubits, seed=42 if circuit_seed is None else circuit_seed).decompose()
     elif name == "Permutation":
         optimization_level = 0
-        circ = Permutation(num_qubits, seed=21)
+        circ = Permutation(num_qubits, seed=21 if circuit_seed is None else circuit_seed)
     elif name == "BV":
-        circ = bv(num_qubits).decompose()
+        circ = bv(num_qubits, seed=26 if circuit_seed is None else circuit_seed).decompose()
     elif name == "SwapTest":
-        circ = swap_test(num_qubits).decompose()
+        circ = swap_test(num_qubits, seed=26 if circuit_seed is None else circuit_seed).decompose()
     elif name == "MCMT":
-        circ = mcmt_circuit(num_qubits).decompose()
+        circ = mcmt_circuit(num_qubits, seed=42 if circuit_seed is None else circuit_seed).decompose()
     elif name == "VQE":
         circ = vqe(num_qubits)
     elif name == "Comparator":
@@ -197,43 +202,47 @@ def qft_adder(num_qubits):
     return circuit.decompose()
 
 
-def mcmt_circuit(num_qubits, gate_width=15, gate_count=10):
+def mcmt_circuit(num_qubits, gate_width=15, gate_count=10, seed=42):
     if gate_width > num_qubits:
         raise ValueError("gate_width must be no larger than num_qubits.")
 
     circuit = QuantumCircuit(num_qubits)
+    python_rng = random.Random(seed)
+    numpy_rng = np.random.default_rng(seed)
     num_controls = gate_width // 2
     num_targets = gate_width - num_controls
 
     for _ in range(gate_count):
-        base_gate = random.choice(
-            [HGate(), RZGate(np.random.uniform(0, 2 * pi))]
+        base_gate = python_rng.choice(
+            [HGate(), RZGate(float(numpy_rng.uniform(0, 2 * pi)))]
         )
         gate = MCMT(base_gate, num_controls, num_targets)
-        qargs = random.sample(range(num_qubits), gate_width)
+        qargs = python_rng.sample(range(num_qubits), gate_width)
         circuit.append(gate, qargs)
 
     return circuit
 
 
-def iqp_circuit(num_qubits):
+def iqp_circuit(num_qubits, seed=42):
     print(f"[IQP] #Qubits: [{num_qubits}]")
-    matrix = np.random.randint(0, 10, size=(num_qubits, num_qubits))
+    rng = np.random.default_rng(seed)
+    matrix = rng.integers(0, 10, size=(num_qubits, num_qubits))
     symmetric_matrix = (matrix + matrix.T) // 2
     return IQP(symmetric_matrix)
 
 
-def pqc(num_qubits, connections_per_qubit=5):
+def pqc(num_qubits, connections_per_qubit=5, seed=42):
     circuit = QuantumCircuit(num_qubits)
+    rng = np.random.default_rng(seed)
     for control in range(num_qubits):
         candidates = [qubit for qubit in range(num_qubits) if qubit != control]
-        targets = np.random.choice(
+        targets = rng.choice(
             candidates,
             size=min(connections_per_qubit, len(candidates)),
             replace=False,
         )
         for target in targets:
-            circuit.crz(np.random.rand() * 2 * pi, control, target)
+            circuit.crz(float(rng.random() * 2 * pi), control, target)
     return circuit
 
 
